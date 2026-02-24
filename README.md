@@ -25,13 +25,14 @@ This isn't a raw EDGAR scraper. The library handles XBRL namespace resolution, f
 
 **Filing Sections** (`section_parser`)
 - Parses qualitative sections from 10-K/10-Q filings (Risk Factors, MD&A, Business, etc.)
+- 8-K earnings release parsing via `source="8k"` — extracts narrative and tables from Item 2.02 exhibits
 - Summary and full-text modes with configurable word limits
 
 **High-Level Tools** (`tools`)
 - `get_financials(ticker, year, quarter)` — all facts for a filing period
 - `get_filings(ticker, year, quarter)` — list available filings (10-Q, 10-K, 8-K)
 - `get_metric(ticker, year, quarter, metric_name)` — single metric lookup with fuzzy matching
-- `get_filing_sections(ticker, year, quarter)` — qualitative section text
+- `get_filing_sections(ticker, year, quarter, source="8k")` — qualitative section text (10-K/10-Q default, or 8-K earnings release)
 
 ## Install
 
@@ -80,7 +81,7 @@ print(matched.head())
 | `get_financials` | `tools` | All facts for a ticker/period, with caching |
 | `get_filings` | `tools` | List SEC filings (10-Q, 10-K, 8-K) for a period |
 | `get_metric` | `tools` | Single metric lookup with fuzzy matching |
-| `get_filing_sections` | `tools` | Qualitative section text (Risk Factors, MD&A, etc.) |
+| `get_filing_sections` | `tools` | Qualitative section text (10-K/10-Q or 8-K with `source="8k"`) |
 | `parse_filing` | `pipeline` | Low-level XBRL fact extraction |
 | `enrich_filing` | `pipeline` | Fiscal period categorization and enrichment |
 | `match_filing` | `matching` | Current vs. prior period alignment |
