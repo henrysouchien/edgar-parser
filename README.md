@@ -91,3 +91,7 @@ print(matched.head())
 - Python 3.10+
 - No API key needed — data comes directly from SEC EDGAR (public)
 - Optional: `ANTHROPIC_API_KEY` environment variable for 8-K extraction
+
+## See also
+
+- **[edgar-mcp](https://github.com/henrysouchien/edgar-mcp)** — MCP server that exposes EDGAR financial data as AI agent tools. If you're building with Claude Code or another MCP-compatible agent, use this instead.
