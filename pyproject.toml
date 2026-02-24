@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "edgar-parser"
-version = "0.2.0"
+version = "0.2.1"
 description = "Structured financial data from SEC EDGAR filings — 10-Q, 10-K, and 8-K"
 readme = "README.md"
 license = "MIT"
