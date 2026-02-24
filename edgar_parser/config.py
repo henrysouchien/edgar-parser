@@ -8,7 +8,7 @@ load_dotenv()
 
 # === HEADERS ======
 HEADERS = {
-    "User-Agent": "edgar-parser (Python library; github.com/henrysouchien/edgar-parser)",
+    "User-Agent": "edgar-parser henry@financialmodelupdater.com",
     "Accept-Encoding": "gzip, deflate",
 }
 

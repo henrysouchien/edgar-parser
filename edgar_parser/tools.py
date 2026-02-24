@@ -743,15 +743,17 @@ def get_filing_sections(
     format: str = "summary",
     max_words: int | None = 3000,
     output: str = "inline",
+    source: str | None = None,
 ) -> dict:
     """
-    Parse qualitative sections from SEC 10-K or 10-Q filings.
+    Parse qualitative sections from SEC filings.
 
     This is the public API entry point. Validates ticker, then delegates
     to section_parser.get_filing_sections_cached().
 
     Defaults to format="summary" (metadata only: section names, word counts,
     filing type). Use format="full" with a sections filter to get text content.
+    Pass source="8k" to parse an earnings-release 8-K exhibit instead of 10-K/10-Q.
 
     Returns structured dict with section text, tables, and word counts.
     """
@@ -785,6 +787,7 @@ def get_filing_sections(
             format=format,
             max_words=max_words,
             output=output,
+            source=source,
         )
         return {"status": "success", **result}
     except ValueError as e:

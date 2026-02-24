@@ -47,6 +47,7 @@ SECTIONS_10Q = {
 
 SECTION_ORDER_10K = ["item_1", "item_1a", "item_1b", "item_2", "item_3", "item_7", "item_7a", "item_8"]
 SECTION_ORDER_10Q = ["part1_item1", "part1_item2", "part1_item3", "part1_item4", "part2_item1", "part2_item1a"]
+SECTION_ORDER_8K = ["earnings_release"]
 
 # Canonical header names — used instead of raw HTML text which may contain
 # anti-scraping spaces (e.g. "FINANCI AL" instead of "FINANCIAL").
@@ -65,6 +66,7 @@ _CANONICAL_HEADERS = {
     "part1_item4": "Part I, Item 4. Controls and Procedures",
     "part2_item1": "Part II, Item 1. Legal Proceedings",
     "part2_item1a": "Part II, Item 1A. Risk Factors",
+    "earnings_release": "Earnings Press Release",
 }
 
 _BODY_REF_PREFIXES = (
@@ -79,22 +81,72 @@ FILE_OUTPUT_DIR = Path(__file__).resolve().parent.parent / "exports" / "file_out
 MAX_BASENAME = 180
 
 
-def fetch_filing_html(ticker: str, year: int, quarter: int) -> tuple[bytes, str, str]:
+def _normalize_sections_source(source: str | None) -> str | None:
+    """Normalize source for get_filing_sections. Returns None or normalized string."""
+    if source is None:
+        return None
+    cleaned = str(source).strip().lower().replace("-", "")
+    if not cleaned:
+        return None
+    return cleaned
+
+
+def _validate_sections_source(source: str | None) -> str | None:
+    normalized = _normalize_sections_source(source)
+    if normalized not in (None, "8k"):
+        raise ValueError(f"Invalid source: '{source}'. Supported values: '8k' or omit for 10-K/10-Q.")
+    return normalized
+
+
+def fetch_filing_html(
+    ticker: str,
+    year: int,
+    quarter: int,
+    source: str | None = None,
+) -> tuple[bytes, str, str]:
     """
     Fetch filing HTML using the existing pipeline.
 
     Returns: (html_bytes, filing_type, htm_url)
 
     Raises:
-        ValueError: if no 10-K/10-Q filing found for the given period.
+        ValueError: if no filing found for the given period/source.
     """
+    normalized_source = _validate_sections_source(source)
+
+    if normalized_source == "8k":
+        from .earnings_8k import find_8k_for_period
+        from .utils import lookup_cik_from_ticker
+
+        cik = lookup_cik_from_ticker(ticker)
+        if cik is None:
+            raise ValueError(f"Could not find CIK for {ticker}")
+
+        entry, html, exhibit_url, _period_end_str = find_8k_for_period(
+            cik,
+            HEADERS,
+            year,
+            quarter,
+            metadata_only=False,
+        )
+        if entry is None or html is None:
+            raise ValueError(f"No 8-K earnings release found for {ticker} Q{quarter} {year}")
+
+        return html.encode("utf-8"), "8-K", exhibit_url
+
     result = get_filings(ticker, year, quarter)
     if result.get("status") != "success" or not result.get("filings"):
-        raise ValueError(f"No filing found for {ticker} {quarter}Q{year}")
+        raise ValueError(
+            f"No 10-K/10-Q found for {ticker} {quarter}Q{year}. "
+            "8-K filings are not included — use source='8k' to request 8-K sections."
+        )
 
     filing = next((f for f in result["filings"] if f.get("form") in ("10-K", "10-Q")), None)
     if not filing:
-        raise ValueError(f"No 10-K/10-Q found for {ticker} {quarter}Q{year}")
+        raise ValueError(
+            f"No 10-K/10-Q found for {ticker} {quarter}Q{year}. "
+            "8-K filings are not included — use source='8k' to request 8-K sections."
+        )
 
     accession = filing.get("accession", "")
     if not accession or "-" not in accession:
@@ -109,7 +161,11 @@ def fetch_filing_html(ticker: str, year: int, quarter: int) -> tuple[bytes, str,
         cik = cik_match.group(1)
     if not cik:
         from .utils import lookup_cik_from_ticker
-        cik = lookup_cik_from_ticker(ticker).lstrip("0") or accession.split("-")[0]
+        ticker_cik = lookup_cik_from_ticker(ticker)
+        if ticker_cik:
+            cik = ticker_cik.lstrip("0") or accession.split("-")[0]
+        else:
+            cik = accession.split("-")[0]
 
     html_bytes, htm_url = fetch_filing_htm(cik, accession)
     return html_bytes, filing["form"], htm_url
@@ -119,17 +175,36 @@ def parse_filing_sections(html_content: bytes | str, filing_type: str) -> dict:
     """
     Parse an SEC filing HTML document into named sections.
     """
-    if filing_type not in ("10-K", "10-Q"):
+    if filing_type not in ("10-K", "10-Q", "8-K"):
         raise ValueError(f"Unsupported filing type: {filing_type}")
 
     soup = BeautifulSoup(html_content, "lxml")
-    headers = find_section_headers(soup, filing_type)
-    section_order = SECTION_ORDER_10K if filing_type == "10-K" else SECTION_ORDER_10Q
-    sections = extract_section_content(soup, headers, section_order)
-
-    sections_found = [key for key in section_order if key in sections]
-    sections_missing = [key for key in section_order if key not in sections]
-    total_word_count = sum(section.get("word_count", 0) for section in sections.values())
+    if filing_type == "8-K":
+        narrative_text = _html_to_text(soup, include_tables=False)
+        tables = []
+        for table in soup.find_all("table"):
+            markdown = table_to_markdown(table)
+            if markdown:
+                tables.append(markdown)
+        word_count = len(narrative_text.split())
+        sections = {
+            "earnings_release": {
+                "header": _CANONICAL_HEADERS["earnings_release"],
+                "text": narrative_text,
+                "tables": tables,
+                "word_count": word_count,
+            }
+        }
+        sections_found = ["earnings_release"]
+        sections_missing = []
+        total_word_count = word_count
+    else:
+        headers = find_section_headers(soup, filing_type)
+        section_order = SECTION_ORDER_10K if filing_type == "10-K" else SECTION_ORDER_10Q
+        sections = extract_section_content(soup, headers, section_order)
+        sections_found = [key for key in section_order if key in sections]
+        sections_missing = [key for key in section_order if key not in sections]
+        total_word_count = sum(section.get("word_count", 0) for section in sections.values())
 
     return {
         "filing_type": filing_type,
@@ -473,7 +548,9 @@ def _build_sections_file_path(
     quarter: int,
     sections: list[str] | None,
     all_sections: dict,
+    source: str | None = None,
 ) -> Path:
+    normalized_source = _validate_sections_source(source)
     requested_raw = [str(key) for key in sections] if sections is not None else None
     requested_raw_sorted = sorted(set(requested_raw or []))
     hash_payload = {
@@ -481,19 +558,21 @@ def _build_sections_file_path(
         "ticker_raw": ticker,
         "year": year,
         "quarter": quarter,
+        "source": normalized_source,
         "sections_raw_sorted": requested_raw_sorted,
     }
 
     ticker_component = _slugify_component(ticker.upper())
     period_component = f"{quarter}Q{year % 100:02d}"
+    source_component = "_8k" if normalized_source == "8k" else ""
     is_unfiltered = _is_unfiltered_sections_request(requested_raw, all_sections)
 
     if is_unfiltered:
-        readable = f"{ticker_component}_{period_component}_sections"
+        readable = f"{ticker_component}_{period_component}{source_component}_sections"
         basename = _finalize_basename(readable, hash8=None, fallback_payload=hash_payload)
     else:
         readable_keys = [_slugify_component(key) for key in requested_raw_sorted] or ["sections"]
-        readable = f"{ticker_component}_{period_component}_{'_'.join(readable_keys)}"
+        readable = f"{ticker_component}_{period_component}{source_component}_{'_'.join(readable_keys)}"
         basename = _finalize_basename(
             readable,
             hash8=_canonical_hash8(hash_payload),
@@ -512,8 +591,16 @@ def _write_sections_markdown(
     requested_sections: list[str] | None,
     total_word_count: int,
     is_empty: bool,
+    source: str | None = None,
 ) -> Path:
-    path = _build_sections_file_path(ticker, year, quarter, requested_sections, all_sections)
+    path = _build_sections_file_path(
+        ticker=ticker,
+        year=year,
+        quarter=quarter,
+        sections=requested_sections,
+        all_sections=all_sections,
+        source=source,
+    )
     section_keys = ", ".join(sections_data.keys()) if sections_data else "none"
     lines = [
         f"# {ticker.upper()} {filing_type} - Q{quarter} FY{year}: Filing Sections",
@@ -555,23 +642,26 @@ def get_filing_sections_cached(
     format: str = "summary",
     max_words: int | None = 3000,
     output: str = "inline",
+    source: str | None = None,
 ) -> dict:
     """
     Get filing sections with file-based caching.
 
     Cache file: exports/{TICKER}_{Q}Q{YY}_sections.json
     """
+    normalized_source = _validate_sections_source(source)
     os.makedirs(EXPORT_UPDATER_DIR, exist_ok=True)
+    source_suffix = "_8k" if normalized_source == "8k" else ""
     cache_path = os.path.join(
         EXPORT_UPDATER_DIR,
-        f"{ticker.upper()}_{quarter}Q{str(year)[-2:]}_sections.json",
+        f"{ticker.upper()}_{quarter}Q{str(year)[-2:]}{source_suffix}_sections.json",
     )
 
     if os.path.exists(cache_path):
         with open(cache_path, "r") as f:
             cached_result = json.load(f)
     else:
-        html_bytes, filing_type, _htm_url = fetch_filing_html(ticker, year, quarter)
+        html_bytes, filing_type, _htm_url = fetch_filing_html(ticker, year, quarter, source=normalized_source)
         cached_result = parse_filing_sections(html_bytes, filing_type)
         with open(cache_path, "w") as f:
             json.dump(cached_result, f)
@@ -588,7 +678,12 @@ def get_filing_sections_cached(
     else:
         result["sections"] = all_sections
         filing_type = result.get("filing_type")
-        expected = SECTION_ORDER_10K if filing_type == "10-K" else SECTION_ORDER_10Q
+        if filing_type == "10-K":
+            expected = SECTION_ORDER_10K
+        elif filing_type == "10-Q":
+            expected = SECTION_ORDER_10Q
+        else:
+            expected = SECTION_ORDER_8K
         result["sections_found"] = [key for key in expected if key in all_sections]
         result["sections_missing"] = [key for key in expected if key not in all_sections]
 
@@ -602,7 +697,14 @@ def get_filing_sections_cached(
     sections_for_file = copy.deepcopy(result["sections"])
 
     if output == "file":
-        attempted_path = _build_sections_file_path(ticker, year, quarter, sections, all_sections)
+        attempted_path = _build_sections_file_path(
+            ticker=ticker,
+            year=year,
+            quarter=quarter,
+            sections=sections,
+            all_sections=all_sections,
+            source=normalized_source,
+        )
         is_empty = len(sections_for_file) == 0
         summary_sections = {
             key: {
@@ -642,6 +744,7 @@ def get_filing_sections_cached(
                 requested_sections=sections,
                 total_word_count=result["metadata"]["total_word_count"],
                 is_empty=is_empty,
+                source=normalized_source,
             )
         except OSError as exc:
             return {
@@ -663,7 +766,10 @@ def get_filing_sections_cached(
                 "word_count": section.get("word_count", 0),
             }
         result["sections"] = summary_sections
-        result["hint"] = "Use format='full' with sections=['item_7'] to get text for a specific section."
+        if result.get("filing_type") == "8-K":
+            result["hint"] = "Use format='full' with sections=['earnings_release'] to get narrative text."
+        else:
+            result["hint"] = "Use format='full' with sections=['item_7'] to get text for a specific section."
         return result
 
     if format != "full":
@@ -672,7 +778,10 @@ def get_filing_sections_cached(
     if sections is None:
         for section in result["sections"].values():
             section["text"] = _truncate(section.get("text", ""), 500)
-        result["hint"] = "Specify sections=['item_7'] to get full text for a specific section."
+        if result.get("filing_type") == "8-K":
+            result["hint"] = "Specify sections=['earnings_release'] to get full narrative text."
+        else:
+            result["hint"] = "Specify sections=['item_7'] to get full text for a specific section."
         return result
 
     for section in result["sections"].values():
