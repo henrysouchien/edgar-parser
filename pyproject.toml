@@ -1,0 +1,31 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "edgar-parser"
+version = "0.1.0"
+description = "Structured financial data from SEC EDGAR filings — 10-Q, 10-K, and 8-K"
+readme = "README.md"
+license = "MIT"
+requires-python = ">=3.10"
+dependencies = [
+    "requests",
+    "pandas",
+    "numpy",
+    "beautifulsoup4",
+    "lxml",
+    "openpyxl",
+    "python-dateutil",
+    "rapidfuzz",
+    "python-dotenv",
+]
+
+[project.optional-dependencies]
+llm = ["anthropic"]
+
+[tool.hatch.build.targets.wheel]
+packages = ["edgar_parser"]
+
+[tool.hatch.build.targets.sdist]
+include = ["edgar_parser/", "pyproject.toml", "README.md", "LICENSE"]
