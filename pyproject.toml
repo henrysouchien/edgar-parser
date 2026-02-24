@@ -9,6 +9,11 @@ description = "Structured financial data from SEC EDGAR filings — 10-Q, 10-K, 
 readme = "README.md"
 license = "MIT"
 requires-python = ">=3.10"
+
+[project.urls]
+Homepage = "https://github.com/henrysouchien/edgar-parser"
+Source = "https://github.com/henrysouchien/edgar-parser"
+Issues = "https://github.com/henrysouchien/edgar-parser/issues"
 dependencies = [
     "requests",
     "pandas",
