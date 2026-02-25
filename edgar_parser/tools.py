@@ -3,13 +3,11 @@
 import importlib
 import importlib.util
 import os
-import time
 from collections import defaultdict
 from pathlib import Path
 
-import requests
-
-from .config import HEADERS, REQUEST_DELAY, N_10K, N_10Q
+from .config import HEADERS, N_10K, N_10Q
+from .http_client import get as http_get
 from .pipeline import FilingNotFoundError
 from .utils import lookup_cik_from_ticker, parse_date
 
@@ -97,7 +95,12 @@ METRIC_ALIASES = {
 }
 
 
-def fetch_recent_10q_10k_accessions(cik: str, headers: dict):
+def fetch_recent_10q_10k_accessions(
+    cik: str,
+    headers: dict,
+    min_10q: int | None = None,
+    min_10k: int | None = None,
+):
     def _extract_submission_arrays(payload: dict, source: str) -> tuple[list, list, list, list]:
         # Main submissions endpoint nests arrays under filings.recent.
         # Overflow archive files expose the same arrays at top level.
@@ -159,7 +162,7 @@ def fetch_recent_10q_10k_accessions(cik: str, headers: dict):
 
     cik_padded = cik.zfill(10)
     url = f"https://data.sec.gov/submissions/CIK{cik_padded}.json"
-    r = requests.get(url, headers=headers)
+    r = http_get(url, headers=headers, rate_limited=True)
     r.raise_for_status()
     data = r.json()
 
@@ -175,11 +178,14 @@ def fetch_recent_10q_10k_accessions(cik: str, headers: dict):
         seen_accessions=seen_accessions,
     )
 
+    target_min_10q = N_10Q if min_10q is None else max(0, int(min_10q))
+    target_min_10k = N_10K if min_10k is None else max(0, int(min_10k))
+
     # High-volume filers may have older submissions split into overflow files.
-    if len(accessions_10q) < N_10Q or len(accessions_10k) < N_10K:
+    if len(accessions_10q) < target_min_10q or len(accessions_10k) < target_min_10k:
         overflow_files = data.get("filings", {}).get("files", [])
         for file_meta in overflow_files:
-            if len(accessions_10q) >= N_10Q and len(accessions_10k) >= N_10K:
+            if len(accessions_10q) >= target_min_10q and len(accessions_10k) >= target_min_10k:
                 break
 
             file_name = file_meta.get("name")
@@ -187,7 +193,7 @@ def fetch_recent_10q_10k_accessions(cik: str, headers: dict):
                 continue
 
             overflow_url = _overflow_file_url(cik, file_name)
-            overflow_resp = requests.get(overflow_url, headers=headers)
+            overflow_resp = http_get(overflow_url, headers=headers, rate_limited=True)
             overflow_resp.raise_for_status()
             overflow_data = overflow_resp.json()
 
@@ -199,7 +205,6 @@ def fetch_recent_10q_10k_accessions(cik: str, headers: dict):
                 seen_accessions=seen_accessions,
             )
 
-            time.sleep(REQUEST_DELAY)
 
     return accessions_10q, accessions_10k
 
@@ -342,8 +347,7 @@ def fetch_filing_htm(cik: str, accession: str) -> tuple[bytes, str]:
     index_url = f"https://www.sec.gov/Archives/edgar/data/{int(cik)}/{acc_nodash}/index.json"
     base_url = f"https://www.sec.gov/Archives/edgar/data/{int(cik)}/{acc_nodash}/"
 
-    r = requests.get(index_url, headers=HEADERS)
-    time.sleep(REQUEST_DELAY)
+    r = http_get(index_url, headers=HEADERS, rate_limited=True)
     r.raise_for_status()
 
     items = r.json().get("directory", {}).get("item", [])
@@ -354,18 +358,18 @@ def fetch_filing_htm(cik: str, accession: str) -> tuple[bytes, str]:
         name = item.get("name", "")
         if not name.lower().endswith(".htm"):
             continue
-        if item.get("size", "").isdigit():
+        size_str = str(item.get("size", ""))
+        if size_str.isdigit():
             sized.append(item)
         else:
             unsized.append(item)
 
-    sized.sort(key=lambda x: int(x["size"]), reverse=True)
+    sized.sort(key=lambda x: int(str(x.get("size", 0))), reverse=True)
     candidates = sized + unsized
 
     for item in candidates:
         url = base_url + item["name"]
-        resp = requests.get(url, headers=HEADERS)
-        time.sleep(REQUEST_DELAY)
+        resp = http_get(url, headers=HEADERS, rate_limited=True)
         if resp.ok and len(resp.content) > 10_000:
             return resp.content, url
 

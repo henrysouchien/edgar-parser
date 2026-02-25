@@ -7,9 +7,24 @@
 # === CONFIG & SETUP ==========================================
 # === Helper: Lookup taxonomy presentation document for target filing ===
 
-import requests
+import threading
 from lxml import etree
 from io import BytesIO
+from .http_client import get as http_get
+
+_NEGATED_LABELS_CACHE = {}
+_CONCEPT_ROLES_CACHE = {}
+_CACHE_LOCK = threading.Lock()
+
+
+def _cache_key(cik, accession_number):
+    return f"{int(cik)}::{accession_number}"
+
+
+def _clone_concept_roles(concept_roles):
+    # Defensive shallow clone so callers can't mutate cached structure.
+    return {tag: list(roles) for tag, roles in concept_roles.items()}
+
 
 def get_negated_label_concepts(cik, accession_number, headers):
     """
@@ -19,9 +34,15 @@ def get_negated_label_concepts(cik, accession_number, headers):
     acc_nodash = accession_number.replace("-", "")
     base_url = f"https://www.sec.gov/Archives/edgar/data/{int(cik)}/{acc_nodash}/"
     index_url = base_url + "index.json"
+    key = _cache_key(cik, accession_number)
+
+    with _CACHE_LOCK:
+        cached = _NEGATED_LABELS_CACHE.get(key)
+    if cached is not None:
+        return set(cached)
 
     try:
-        r_index = requests.get(index_url, headers=headers)
+        r_index = http_get(index_url, headers=headers, rate_limited=True)
         r_index.raise_for_status()
         index_data = r_index.json()
         items = index_data.get("directory", {}).get("item", [])
@@ -32,7 +53,7 @@ def get_negated_label_concepts(cik, accession_number, headers):
         
         pre_url = base_url + pre_file
         print(f"🔗 Downloading .pre.xml from: {pre_url}")  # 👈 Add this here
-        r_pre = requests.get(pre_url, headers=headers)
+        r_pre = http_get(pre_url, headers=headers, rate_limited=True)
         r_pre.raise_for_status()
         tree = etree.parse(BytesIO(r_pre.content))
 
@@ -47,6 +68,8 @@ def get_negated_label_concepts(cik, accession_number, headers):
                         concept = href.split("#")[-1].replace("_", ":")
                         negated_concepts.add(concept)
         print(f"✅ Found {len(negated_concepts)} concepts with negated labels.")
+        with _CACHE_LOCK:
+            _NEGATED_LABELS_CACHE[key] = set(negated_concepts)
         return negated_concepts
     except Exception as e:
         print(f"❌ Error in get_negated_label_concepts: {e}")
@@ -73,9 +96,15 @@ def get_concept_roles_from_presentation(cik, accession_number, headers):
     acc_nodash = accession_number.replace("-", "")
     base_url = f"https://www.sec.gov/Archives/edgar/data/{int(cik)}/{acc_nodash}/"
     index_url = base_url + "index.json"
+    key = _cache_key(cik, accession_number)
+
+    with _CACHE_LOCK:
+        cached = _CONCEPT_ROLES_CACHE.get(key)
+    if cached is not None:
+        return _clone_concept_roles(cached)
 
     try:
-        r_index = requests.get(index_url, headers=headers)
+        r_index = http_get(index_url, headers=headers, rate_limited=True)
         r_index.raise_for_status()
         index_data = r_index.json()
         items = index_data.get("directory", {}).get("item", [])
@@ -86,7 +115,7 @@ def get_concept_roles_from_presentation(cik, accession_number, headers):
 
         pre_url = base_url + pre_file
         print(f"🔗 Downloading .pre.xml from: {pre_url}")
-        r_pre = requests.get(pre_url, headers=headers)
+        r_pre = http_get(pre_url, headers=headers, rate_limited=True)
         r_pre.raise_for_status()
         tree = etree.parse(BytesIO(r_pre.content))
 
@@ -118,6 +147,8 @@ def get_concept_roles_from_presentation(cik, accession_number, headers):
                     concept_roles.setdefault(concept, []).append(normalized_role)
 
         print(f"✅ Extracted {len(concept_roles)} concept → role mappings from .pre.xml")
+        with _CACHE_LOCK:
+            _CONCEPT_ROLES_CACHE[key] = _clone_concept_roles(concept_roles)
         return concept_roles
 
     except Exception as e:
@@ -126,7 +157,4 @@ def get_concept_roles_from_presentation(cik, accession_number, headers):
 
 
 # In[ ]:
-
-
-
 

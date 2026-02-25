@@ -18,8 +18,8 @@ This isn't a raw EDGAR scraper. The library handles XBRL namespace resolution, f
 - Handles quarterly, full-year, and 4Q (derived annual) modes
 - Zip-matching with adaptive fallback to fuzzy matching for edge cases
 
-**8-K Earnings Extraction** (`earnings_8k`) — *optional, requires `anthropic`*
-- Extracts financial data from 8-K earnings press releases using Claude
+**8-K Earnings Extraction** (`earnings_8k`) — *optional, requires `anthropic` or `openai`*
+- Extracts financial data from 8-K earnings press releases using Claude (primary) with OpenAI GPT-4o fallback
 - Automatic fallback when 10-Q/10-K is not yet available for a period
 - Same output schema as core extraction for seamless integration
 
@@ -40,7 +40,7 @@ This isn't a raw EDGAR scraper. The library handles XBRL namespace resolution, f
 pip install edgar-parser
 ```
 
-For 8-K earnings extraction (uses Claude API):
+For 8-K earnings extraction (uses Claude API with OpenAI fallback):
 
 ```bash
 pip install "edgar-parser[llm]"
@@ -92,6 +92,7 @@ print(matched.head())
 - Python 3.10+
 - No API key needed — data comes directly from SEC EDGAR (public)
 - Optional: `ANTHROPIC_API_KEY` environment variable for 8-K extraction
+- Optional: `OPENAI_API_KEY` environment variable for 8-K fallback when Anthropic API is unavailable
 
 ## See also
 

@@ -9,21 +9,22 @@ from datetime import datetime, timedelta
 from io import BytesIO
 
 import pandas as pd
-import requests
 from bs4 import BeautifulSoup
 from bs4 import XMLParsedAsHTMLWarning
 
 from .config import (
+    ADAPTIVE_DISCOVERY,
     EXPORT_UPDATER_DIR,
     HEADERS,
+    INFER_PERIOD_END_FROM_FILENAME,
     N_10K as N_10K_BASE,
     N_10K_EXTRA,
     N_10Q as N_10Q_BASE,
     N_10Q_EXTRA,
     OUTPUT_METRICS_DIR,
-    REQUEST_DELAY,
 )
 from .enrich import get_concept_roles_from_presentation, get_negated_label_concepts
+from .http_client import get as http_get
 from .utils import (
     AXIS_COLS,
     extract_dimensions_from_context,
@@ -105,7 +106,11 @@ def enrich_filing(filing, results_10q, results_10k):
         
     # === Block to prevent extraction from filings before 2019 (no XBRL) ===
     if doc_end_date < parse_date("2019-01-01"):
-        raise ValueError(f"⚡ Filing date {doc_end_date} is before 2019. Sorry - this script only supports EDGAR filings from 2019 onward (inline XBRL not reliable before that). Please choose a filing from 2018 or later.")
+        raise ValueError(
+            f"⚡ Filing date {doc_end_date} is before 2019. "
+            "This script only supports EDGAR filings from 2019 onward "
+            "(inline XBRL not reliable before that). Please choose a filing from 2019 or later."
+        )
     
     print("--------------------------------------------------")
     if filing.get("form") == "10-K":
@@ -184,7 +189,7 @@ def enrich_filing(filing, results_10q, results_10k):
                 if candidate_end < doc_end_date:
                     doc_start_date = candidate_end + timedelta(days=1)
                     break
-            except:
+            except Exception:
                 continue
             
         if not doc_start_date:
@@ -206,19 +211,22 @@ def enrich_filing(filing, results_10q, results_10k):
                 ):
                     q_end = parse_date(q["document_period_end"])
                     if q_end:
-                        prior_end_date = parse_date(q_end)
+                        prior_end_date = q_end
                         break
 
         prior_start_date = None
         
-        for prior in prior_filings:
-            try:
-                candidate_end = parse_date(prior["document_period_end"])
-                if candidate_end < prior_end_date:
-                    prior_start_date = candidate_end + timedelta(days=1)
-                    break
-            except:
-                continue
+        if prior_end_date:
+            for prior in prior_filings:
+                try:
+                    candidate_end = parse_date(prior["document_period_end"])
+                    if not candidate_end:
+                        continue
+                    if candidate_end < prior_end_date:
+                        prior_start_date = candidate_end + timedelta(days=1)
+                        break
+                except Exception:
+                    continue
         
     # Fallback: if either value is still missing
     if not prior_start_date or not prior_end_date:
@@ -382,7 +390,7 @@ def enrich_filing(filing, results_10q, results_10k):
     return df
 
 
-def fetch_recent_10q_10k_accessions(cik, headers, n_10q, n_10k):
+def fetch_recent_10q_10k_accessions(cik, headers, n_10q, n_10k, min_10q=None, min_10k=None):
 
     """
     Fetches recent 10-Q and 10-K filings for a given company from the SEC EDGAR submissions JSON API.
@@ -465,7 +473,7 @@ def fetch_recent_10q_10k_accessions(cik, headers, n_10q, n_10k):
 
     cik_padded = cik.zfill(10)
     url = f"https://data.sec.gov/submissions/CIK{cik_padded}.json"
-    r = requests.get(url, headers=headers)
+    r = http_get(url, headers=headers)
     r.raise_for_status()
     data = r.json()
 
@@ -481,11 +489,14 @@ def fetch_recent_10q_10k_accessions(cik, headers, n_10q, n_10k):
         seen_accessions=seen_accessions,
     )
 
+    target_min_10q = n_10q if min_10q is None else max(0, int(min_10q))
+    target_min_10k = n_10k if min_10k is None else max(0, int(min_10k))
+
     # High-volume filers may have older submissions split into overflow files.
-    if len(accessions_10q) < n_10q or len(accessions_10k) < n_10k:
+    if len(accessions_10q) < target_min_10q or len(accessions_10k) < target_min_10k:
         overflow_files = data.get("filings", {}).get("files", [])
         for file_meta in overflow_files:
-            if len(accessions_10q) >= n_10q and len(accessions_10k) >= n_10k:
+            if len(accessions_10q) >= target_min_10q and len(accessions_10k) >= target_min_10k:
                 break
 
             file_name = file_meta.get("name")
@@ -493,7 +504,7 @@ def fetch_recent_10q_10k_accessions(cik, headers, n_10q, n_10k):
                 continue
 
             overflow_url = _overflow_file_url(cik, file_name)
-            overflow_resp = requests.get(overflow_url, headers=headers)
+            overflow_resp = http_get(overflow_url, headers=headers, rate_limited=True)
             overflow_resp.raise_for_status()
             overflow_data = overflow_resp.json()
 
@@ -505,7 +516,6 @@ def fetch_recent_10q_10k_accessions(cik, headers, n_10q, n_10k):
                 seen_accessions=seen_accessions,
             )
 
-            time.sleep(REQUEST_DELAY)
 
     print(f"✅ Found {len(accessions_10q)} 10-Q accessions (filing submissions)")
     print(f"✅ Found {len(accessions_10k)} 10-K accessions (filing submissions)")
@@ -542,7 +552,7 @@ def filter_filings_by_year(accessions, max_year, n_limit):
             continue
         try:
             yr = int(date_str.split("-")[0])
-        except:
+        except Exception:
             continue
         if yr > max_year:
             continue
@@ -836,6 +846,166 @@ def filter_10k_accessions(accessions_10k, fiscal_year, quarter):
     return filtered
 
 
+def _enrich_parsed_10k_results(results_10k):
+    """Attach fiscal year metadata to parsed 10-K results in-place."""
+    for filing in results_10k:
+        period_end = filing.get("document_period_end")
+        dt = parse_date(period_end)
+        if dt:
+            filing["year"] = dt.year
+            filing["fiscal_year_end"] = dt
+        else:
+            filing["year"] = None
+            filing["fiscal_year_end"] = None
+    return results_10k
+
+
+def _label_parsed_10q_results(results_10q, results_10k):
+    """Label parsed 10-Q results using parsed 10-K fiscal year ends."""
+    fiscal_year_ends = []
+    for entry in results_10k:
+        fy_date = parse_date(entry.get("document_period_end"))
+        if fy_date:
+            fiscal_year_ends.append(fy_date)
+    fiscal_year_ends = sorted(fiscal_year_ends, reverse=True)
+    if not fiscal_year_ends:
+        return False
+
+    for filing in results_10q:
+        q_date = parse_date(filing.get("document_period_end"))
+        if not q_date:
+            filing["quarter"] = None
+            filing["label"] = None
+            continue
+
+        candidates = [fy for fy in fiscal_year_ends if fy >= q_date]
+        if candidates:
+            matched_fy = min(candidates)
+            used_fallback = False
+        else:
+            candidates = [fy for fy in fiscal_year_ends if fy < q_date]
+            matched_fy = max(candidates) if candidates else None
+            used_fallback = True
+
+        if matched_fy and used_fallback:
+            matched_fy = matched_fy.replace(year=matched_fy.year + 1)
+
+        if not matched_fy:
+            filing["quarter"] = None
+            filing["label"] = None
+            continue
+
+        days_diff = (matched_fy - q_date).days
+        if 70 <= days_diff <= 120:
+            quarter_label = "Q3"
+        elif 160 <= days_diff <= 200:
+            quarter_label = "Q2"
+        elif 250 <= days_diff <= 300:
+            quarter_label = "Q1"
+        else:
+            filing["quarter"] = None
+            filing["label"] = None
+            filing["non_standard_period"] = True
+            continue
+
+        filing["fiscal_year_end"] = matched_fy
+        filing["quarter"] = quarter_label
+        filing["year"] = q_date.year
+        filing["label"] = f"{quarter_label[1:]}Q{str(matched_fy.year)[-2:]}"
+
+    return True
+
+
+def _fallback_coverage_satisfied(results_10q, results_10k, fiscal_year, quarter, four_q_mode):
+    """Check whether parsed fallback results satisfy downstream filing dependencies."""
+    if not results_10k:
+        return False, "no parsed 10-K results"
+
+    _enrich_parsed_10k_results(results_10k)
+    if not _label_parsed_10q_results(results_10q, results_10k):
+        return False, "unable to label 10-Q results from parsed 10-K anchors"
+
+    if four_q_mode:
+        target_10k = next((k for k in results_10k if k.get("year") == fiscal_year), None)
+        prior_10k = next((k for k in results_10k if k.get("year") == (fiscal_year - 1)), None)
+        if not target_10k:
+            return False, f"missing target 10-K year {fiscal_year}"
+        if not prior_10k:
+            return False, f"missing prior 10-K year {fiscal_year - 1}"
+
+        fye_target = target_10k.get("fiscal_year_end")
+        fye_prior = prior_10k.get("fiscal_year_end")
+        q3_current = next(
+            (q for q in results_10q if q.get("quarter") == "Q3" and q.get("fiscal_year_end") == fye_target),
+            None,
+        )
+        q3_prior = next(
+            (q for q in results_10q if q.get("quarter") == "Q3" and q.get("fiscal_year_end") == fye_prior),
+            None,
+        )
+        if not q3_current:
+            return False, f"missing current-year Q3 for FY {fiscal_year}"
+        if not q3_prior:
+            return False, f"missing prior-year Q3 for FY {fiscal_year - 1}"
+        return True, "4Q coverage satisfied"
+
+    target_label = f"{quarter}Q{str(fiscal_year)[-2:]}"
+    target_10q = next((q for q in results_10q if q.get("label") == target_label), None)
+    if not target_10q:
+        return False, f"missing target 10-Q label {target_label}"
+
+    target_quarter = target_10q.get("quarter")
+    target_fye = target_10q.get("fiscal_year_end")
+    prior_10q = next(
+        (
+            q for q in results_10q
+            if q.get("quarter") == target_quarter
+            and q.get("fiscal_year_end")
+            and target_fye
+            and q["fiscal_year_end"].year == (target_fye.year - 1)
+        ),
+        None,
+    )
+    if not prior_10q:
+        return False, f"missing prior-year 10-Q for quarter {target_quarter}"
+
+    return True, "quarterly coverage satisfied"
+
+
+def _remaining_entries(full_entries, selected_entries):
+    """Return entries not included in the selected subset (by accession)."""
+    selected_accessions = {entry.get("accession") for entry in selected_entries if entry.get("accession")}
+    return [entry for entry in full_entries if entry.get("accession") not in selected_accessions]
+
+
+def _merge_entries_by_accession(primary_entries, fallback_entries, max_items=None):
+    """Merge entry lists while preserving order and de-duplicating by accession."""
+    merged = []
+    seen_accessions = set()
+    for entry in list(primary_entries) + list(fallback_entries):
+        accession = entry.get("accession")
+        if accession:
+            if accession in seen_accessions:
+                continue
+            seen_accessions.add(accession)
+        merged.append(entry)
+        if max_items is not None and len(merged) >= max_items:
+            break
+    return merged
+
+
+def _sort_results_by_accession_order(results, source_entries):
+    """Sort parsed results by accession order from the original source list."""
+    accession_order = {
+        entry.get("accession"): idx for idx, entry in enumerate(source_entries) if entry.get("accession")
+    }
+    return sorted(results, key=lambda row: accession_order.get(row.get("accession"), len(accession_order)))
+
+
+def _sort_accessions_by_report_date_desc(accessions):
+    """Sort accession metadata newest-first using report_date."""
+    return sorted(accessions, key=lambda entry: entry.get("report_date", ""), reverse=True)
+
 
 def fetch_10q_10k_accessions_from_master (cik, headers, years=None, quarters=None):
     
@@ -884,8 +1054,7 @@ def fetch_10q_10k_accessions_from_master (cik, headers, years=None, quarters=Non
             url = f"https://www.sec.gov/Archives/edgar/full-index/{year}/{qtr}/master.gz"
             print(f"📦 Downloading: {url}")
             try:
-                r = requests.get(url, headers=headers)
-                time.sleep(REQUEST_DELAY)
+                r = http_get(url, headers=headers, rate_limited=True)
                 r.raise_for_status()
             except Exception as e:
                 print(f"❌ Failed to fetch {year} {qtr}: {e}")
@@ -924,6 +1093,8 @@ def fetch_10q_10k_accessions_from_master (cik, headers, years=None, quarters=Non
                     elif form == "10-K":
                         accessions_10k.append(entry)
 
+    accessions_10q = _sort_accessions_by_report_date_desc(accessions_10q)
+    accessions_10k = _sort_accessions_by_report_date_desc(accessions_10k)
     print(f"✅ Found {len(accessions_10q)} 10-Q accessions (from master index)")
     print(f"✅ Found {len(accessions_10k)} 10-K accessions (from master index)")
     return accessions_10q, accessions_10k
@@ -936,6 +1107,50 @@ def _safe_int(val):
         return int(float(val))
     except (ValueError, TypeError):
         return None
+
+
+def _compute_percentile(values, percentile):
+    """Return percentile from a numeric list using linear interpolation."""
+    if not values:
+        return None
+    sorted_values = sorted(values)
+    if len(sorted_values) == 1:
+        return float(sorted_values[0])
+    rank = (len(sorted_values) - 1) * percentile
+    lower_index = int(rank)
+    upper_index = min(lower_index + 1, len(sorted_values) - 1)
+    lower_value = sorted_values[lower_index]
+    upper_value = sorted_values[upper_index]
+    if upper_index == lower_index:
+        return float(lower_value)
+    weight = rank - lower_index
+    return float(lower_value + (upper_value - lower_value) * weight)
+
+
+def _infer_document_period_end_from_filename(filename, report_date=None):
+    """Infer YYYY-MM-DD period end from filename date tokens when confidence is high."""
+    name = str(filename or "").lower()
+    date_tokens = re.findall(r"(?<!\d)(20\d{2})(\d{2})(\d{2})(?!\d)", name)
+    if not date_tokens:
+        return None
+
+    parsed_report_date = parse_date(report_date) if report_date else None
+    candidates = []
+    for year_str, month_str, day_str in date_tokens:
+        try:
+            inferred_dt = datetime(int(year_str), int(month_str), int(day_str)).date()
+        except ValueError:
+            continue
+        if parsed_report_date:
+            if inferred_dt > parsed_report_date:
+                continue
+            if (parsed_report_date - inferred_dt).days > 400:
+                continue
+        candidates.append(inferred_dt)
+
+    if not candidates:
+        return None
+    return min(candidates).isoformat()
 
 
 
@@ -976,11 +1191,10 @@ def extract_facts_with_document_period(ixbrl_url, headers):
     print(f"\n🌐 Fetching iXBRL: {ixbrl_url}")
     t0 = time.time()
 
-    r = requests.get(ixbrl_url, headers=headers)
+    r = http_get(ixbrl_url, headers=headers, rate_limited=True)
     fetch_time = time.time() - t0
     print(f"⏳ Fetch time: {fetch_time:.2f} seconds")
 
-    time.sleep(REQUEST_DELAY)
     r.raise_for_status()
 
     t1 = time.time()
@@ -1011,7 +1225,7 @@ def extract_facts_with_document_period(ixbrl_url, headers):
             context_blocks[ctx_id] = str(ctx_tag)  # Save the raw HTML block
 
     # --- Then: Extract all facts ---
-    for tag in soup.find_all(["ix:nonfraction", "ix:nonnumeric"]):
+    for tag in ix_tags:
         name = tag.get("name")
         ctx = tag.get("contextref")
         sign = tag.get("sign")
@@ -1048,7 +1262,7 @@ def extract_facts_with_document_period(ixbrl_url, headers):
     }
 
 
-def try_all_htm_files(cik, accession_number, headers):
+def try_all_htm_files(cik, accession_number, headers, profile=None, report_date=None):
 
     """
     Attempts to extract structured financial data from all .htm files within a specific SEC EDGAR filing accession.
@@ -1082,45 +1296,87 @@ def try_all_htm_files(cik, accession_number, headers):
         print(results[0]["document_period_end"])  # → "2023-12-31"
     """
 
+    profile_data = {
+        "accession": accession_number,
+        "index_fetch_seconds": 0.0,
+        "index_fetch_ok": False,
+        "htm_candidates": 0,
+        "htm_attempts": 0,
+        "htm_attempt_seconds_total": 0.0,
+        "used_fallback_scan": False,
+        "selected_file": None,
+        "selected_fact_count": 0,
+        "inferred_period_end_used": False,
+    }
+
     acc_nodash = accession_number.replace("-", "")
     index_url = f"https://www.sec.gov/Archives/edgar/data/{int(cik)}/{acc_nodash}/index.json"
     base_url = f"https://www.sec.gov/Archives/edgar/data/{int(cik)}/{acc_nodash}/"
-    
+
+    index_start = time.time()
     try:
-        r = requests.get(index_url, headers=headers)
-        time.sleep(REQUEST_DELAY)
+        r = http_get(index_url, headers=headers, rate_limited=True)
         r.raise_for_status()
         index = r.json()
+        profile_data["index_fetch_ok"] = True
     except Exception as e:
         print(f"❌ Failed to fetch index.json for {accession_number}: {e}")
+        profile_data["index_fetch_seconds"] = round(time.time() - index_start, 4)
+        if profile is not None:
+            profile.update(profile_data)
         return []
+    profile_data["index_fetch_seconds"] = round(time.time() - index_start, 4)
 
     items = index.get("directory", {}).get("item", [])
     results = []
-    
-    # === Try largest .htm file by size first ===    
+
+    # === Try largest .htm file by size first ===
     htm_items = [
         item for item in items
         if item["name"].lower().endswith(".htm") and item.get("size", "").isdigit()
     ]
-    
+    profile_data["htm_candidates"] = len(htm_items)
+
+    tried_htm_names = set()
     if htm_items:
         # Sort descending by file size
         htm_items.sort(key=lambda x: int(x["size"]), reverse=True)
         largest_htm = htm_items[0]["name"]
+        tried_htm_names.add(largest_htm)
         full_url = base_url + largest_htm
         print(f"📏 Trying largest .htm file first: {largest_htm} ({htm_items[0]['size']} bytes)")
 
         try:
+            attempt_start = time.time()
             data = extract_facts_with_document_period(full_url, headers)
-            
-            if data["document_period_end"] and len(data["facts"]) >= 50:
-                # Fetch presentation roles from .pre.xml                    
+            profile_data["htm_attempts"] += 1
+            profile_data["htm_attempt_seconds_total"] += time.time() - attempt_start
+
+            period_end = data.get("document_period_end")
+            if (
+                not period_end
+                and INFER_PERIOD_END_FROM_FILENAME
+                and len(data.get("facts", [])) >= 1000
+            ):
+                inferred_period_end = _infer_document_period_end_from_filename(
+                    largest_htm,
+                    report_date=report_date,
+                )
+                if inferred_period_end:
+                    period_end = inferred_period_end
+                    data["document_period_end"] = inferred_period_end
+                    data["document_period_label"] = inferred_period_end
+                    profile_data["inferred_period_end_used"] = True
+
+            if period_end and len(data["facts"]) >= 50:
+                # Fetch presentation roles from .pre.xml
                 concept_roles = get_concept_roles_from_presentation(cik, accession_number, headers)
-                
+
                 print(f"✅ {full_url} → Period End: {data['document_period_end']}")
                 print(f"🔎 Extracted {len(data['facts'])} facts")
-            
+
+                profile_data["selected_file"] = largest_htm
+                profile_data["selected_fact_count"] = len(data["facts"])
                 results.append({
                     "file": largest_htm,
                     "url": full_url,
@@ -1128,35 +1384,67 @@ def try_all_htm_files(cik, accession_number, headers):
                     "document_period_label": data["document_period_label"],
                     "facts": data["facts"],
                     "context_blocks": data["context_blocks"],
-                    "concept_roles": concept_roles
+                    "concept_roles": concept_roles,
                 })
+                profile_data["htm_attempt_seconds_total"] = round(profile_data["htm_attempt_seconds_total"], 4)
+                if profile is not None:
+                    profile.update(profile_data)
                 return results  # ✅ Success: stop here
-                                    
+
         except Exception as e:
             print(f"⚠️ Error checking largest .htm file: {e}")
 
     # === Fallback: Try all other .htm files ===
     print("🔁 Fallback: checking all .htm files...")
-    for item in items:
-        name = item["name"].lower()
-        if not name.endswith(".htm"):
-            continue
+    profile_data["used_fallback_scan"] = True
+    fallback_htm_items = [
+        item for item in items
+        if item.get("name", "").lower().endswith(".htm") and item.get("name") not in tried_htm_names
+    ]
+    fallback_htm_items.sort(
+        key=lambda item: int(item["size"]) if str(item.get("size", "")).isdigit() else -1,
+        reverse=True,
+    )
+    for item in fallback_htm_items:
 
         full_url = base_url + item["name"]
         try:
+            attempt_start = time.time()
             data = extract_facts_with_document_period(full_url, headers)
+            profile_data["htm_attempts"] += 1
+            profile_data["htm_attempt_seconds_total"] += time.time() - attempt_start
 
-            if data["document_period_end"]:
+            period_end = data.get("document_period_end")
+            if (
+                not period_end
+                and INFER_PERIOD_END_FROM_FILENAME
+                and len(data.get("facts", [])) >= 1000
+            ):
+                inferred_period_end = _infer_document_period_end_from_filename(
+                    item["name"],
+                    report_date=report_date,
+                )
+                if inferred_period_end:
+                    period_end = inferred_period_end
+                    data["document_period_end"] = inferred_period_end
+                    data["document_period_label"] = inferred_period_end
+                    profile_data["inferred_period_end_used"] = True
+
+            if period_end:
                 if len(data["facts"]) < 50:
-                    print(f"⚠️ Warning: only {len(data['facts'])} facts extracted from {full_url} — possible exhibit or junk file.")
+                    print(
+                        f"⚠️ Warning: only {len(data['facts'])} facts extracted from {full_url} — possible exhibit or junk file."
+                    )
                     continue  # Skip this .htm and keep looking
 
                 # Fetch presentation roles from .pre.xml
                 concept_roles = get_concept_roles_from_presentation(cik, accession_number, headers)
-                
+
                 print(f"✅ {full_url} → Period End: {data['document_period_end']}")
                 print(f"🔎 Extracted {len(data['facts'])} facts")
-                      
+
+                profile_data["selected_file"] = item["name"]
+                profile_data["selected_fact_count"] = len(data["facts"])
                 results.append({
                     "file": item["name"],
                     "url": full_url,
@@ -1164,7 +1452,7 @@ def try_all_htm_files(cik, accession_number, headers):
                     "document_period_label": data["document_period_label"],
                     "facts": data["facts"],
                     "context_blocks": data["context_blocks"],  # 🆕 Capture context blocks too
-                    "concept_roles": concept_roles
+                    "concept_roles": concept_roles,
                 })
                 if STOP_AFTER_FIRST_VALID_PERIOD:
                     break  # 🔥 Stop scanning more .htms once one good file is found
@@ -1173,6 +1461,9 @@ def try_all_htm_files(cik, accession_number, headers):
             print(f"⚠️ Error checking {item['name']}: {e}")
             continue
 
+    profile_data["htm_attempt_seconds_total"] = round(profile_data["htm_attempt_seconds_total"], 4)
+    if profile is not None:
+        profile.update(profile_data)
     return results
 
 
@@ -1214,20 +1505,46 @@ def extract_filing_batch(accessions, cik, headers, form_type):
     """
     
     results = []
+    profile_rows = []
     for i, entry in enumerate(accessions):
         acc = entry["accession"]
         report_date = entry["report_date"]
+        accession_start = time.time()
+        profile = {
+            "accession": acc,
+            "report_date": report_date,
+            "pre_2019_skipped": False,
+            "success": False,
+            "result_count": 0,
+            "elapsed_seconds": 0.0,
+            "index_fetch_seconds": 0.0,
+            "index_fetch_ok": False,
+            "htm_candidates": 0,
+            "htm_attempts": 0,
+            "htm_attempt_seconds_total": 0.0,
+            "used_fallback_scan": False,
+            "selected_file": None,
+            "selected_fact_count": 0,
+            "inferred_period_end_used": False,
+        }
 
         # 🚫 Skip filings before 2019 (no inline XBRL guaranteed)
         if int(report_date[:4]) < 2019:
             print(f"⏩ Skipping {acc} — pre-2019 filing")
+            profile["pre_2019_skipped"] = True
+            profile["elapsed_seconds"] = round(time.time() - accession_start, 4)
+            profile_rows.append(profile)
             continue
             
         print(f"\n🔍 {form_type} Accession {i+1}: {acc} | Report or Filing Date: {report_date}")
-        extracted = try_all_htm_files(cik, acc, headers)
+        extracted = try_all_htm_files(cik, acc, headers, profile=profile, report_date=report_date)
         
         if not extracted:
+            profile["elapsed_seconds"] = round(time.time() - accession_start, 4)
+            profile_rows.append(profile)
             continue
+        profile["success"] = True
+        profile["result_count"] = len(extracted)
         for result in extracted:
             results.append({
                 "accession": acc,
@@ -1241,6 +1558,48 @@ def extract_filing_batch(accessions, cik, headers, form_type):
                 "concept_roles": result["concept_roles"],
                 "form": form_type
             })
+
+        profile["elapsed_seconds"] = round(time.time() - accession_start, 4)
+        profile_rows.append(profile)
+
+    form_key = form_type.lower().replace("-", "")
+    elapsed_values = [row["elapsed_seconds"] for row in profile_rows]
+    slowest_rows = sorted(profile_rows, key=lambda row: row["elapsed_seconds"], reverse=True)[:5]
+    extraction_profile_summary = {
+        "accession_total": len(profile_rows),
+        "accession_success": sum(1 for row in profile_rows if row["success"]),
+        "pre_2019_skipped": sum(1 for row in profile_rows if row["pre_2019_skipped"]),
+        "elapsed_seconds_total": round(sum(elapsed_values), 4),
+        "elapsed_seconds_p50": round(_compute_percentile(elapsed_values, 0.5) or 0.0, 4),
+        "elapsed_seconds_p90": round(_compute_percentile(elapsed_values, 0.9) or 0.0, 4),
+        "htm_candidates_total": sum(row.get("htm_candidates", 0) for row in profile_rows),
+        "htm_attempts_total": sum(row.get("htm_attempts", 0) for row in profile_rows),
+        "htm_attempt_seconds_total": round(sum(row.get("htm_attempt_seconds_total", 0.0) for row in profile_rows), 4),
+        "fallback_scan_accessions": sum(1 for row in profile_rows if row.get("used_fallback_scan")),
+        "slowest_accessions": [
+            {
+                "accession": row["accession"],
+                "report_date": row["report_date"],
+                "elapsed_seconds": row["elapsed_seconds"],
+                "success": row["success"],
+                "htm_candidates": row.get("htm_candidates", 0),
+                "htm_attempts": row.get("htm_attempts", 0),
+                "used_fallback_scan": row.get("used_fallback_scan", False),
+                "selected_file": row.get("selected_file"),
+                "selected_fact_count": row.get("selected_fact_count", 0),
+                "inferred_period_end_used": row.get("inferred_period_end_used", False),
+            }
+            for row in slowest_rows
+        ],
+    }
+    log_metric(f"extraction_profile_{form_key}", extraction_profile_summary)
+    print(
+        f"📈 {form_type} extraction profile: accessions={extraction_profile_summary['accession_total']} "
+        f"success={extraction_profile_summary['accession_success']} "
+        f"p50={extraction_profile_summary['elapsed_seconds_p50']:.2f}s "
+        f"p90={extraction_profile_summary['elapsed_seconds_p90']:.2f}s "
+        f"htm_attempts={extraction_profile_summary['htm_attempts_total']}"
+    )
     return results
 
 
@@ -1265,6 +1624,31 @@ def parse_filing(
     N_10Q = N_10Q_BASE
     N_10K = N_10K_BASE
 
+    # Explicit defaults for downstream return payload fields.
+    target_label = None
+    annual_label = None
+    target_10q = None
+    prior_10q = None
+    target_10k = None
+    prior_10k = None
+    q1_entry = None
+    q2_entry = None
+    q3_entry = None
+    q1_prior_entry = None
+    q2_prior_entry = None
+    q3_prior_entry = None
+    df_current = None
+    df_prior = None
+    df_current_10k = None
+    df_prior_10k = None
+    df_q1 = None
+    df_q2 = None
+    df_q3 = None
+    df_q1_prior = None
+    df_q2_prior = None
+    df_q3_prior = None
+    negated_tags = set()
+
     # === Add inputs to metrics dictionary ===
     metrics.update({
         "ticker": ticker,
@@ -1285,12 +1669,8 @@ def parse_filing(
     FOUR_Q_MODE = (QUARTER == 4)  # 🆕 Build 4Q flag
 
     # Adjust number of filings to pull based on mode - # You might need more for 4Q builds (Q1–Q3 of both years)
-    if FOUR_Q_MODE:
-        N_10Q = N_10Q + N_10Q_EXTRA
-        N_10K = N_10K + N_10K_EXTRA
-    else:
-        N_10Q = N_10Q + N_10Q_EXTRA
-        N_10K = N_10K + N_10K_EXTRA
+    N_10Q = N_10Q + N_10Q_EXTRA
+    N_10K = N_10K + N_10K_EXTRA
 
     # === Enforce quarter numbers == 
 
@@ -1343,7 +1723,21 @@ def parse_filing(
 
 
     # === FETCH 10Q/10K ACCESSIONS ===
-    accessions_10q, accessions_10k = fetch_recent_10q_10k_accessions(CIK, HEADERS, N_10Q, N_10K)
+    if ADAPTIVE_DISCOVERY:
+        required_min_10q = 6
+        required_min_10k = 3
+    else:
+        required_min_10q = N_10Q
+        required_min_10k = N_10K
+
+    accessions_10q, accessions_10k = fetch_recent_10q_10k_accessions(
+        CIK,
+        HEADERS,
+        N_10Q,
+        N_10K,
+        min_10q=required_min_10q,
+        min_10k=required_min_10k,
+    )
     print(accessions_10q[:2], accessions_10k[:1]) #preview
 
     # === FILTER BY YEAR AND MAX FILINGS ===
@@ -1351,7 +1745,7 @@ def parse_filing(
     accessions_10k = filter_filings_by_year(accessions_10k, YEAR, N_10K)
 
     # === If too few filings, fallback to full master index scan
-    if len(accessions_10q) < N_10Q or len(accessions_10k) < N_10K:
+    if len(accessions_10q) < required_min_10q or len(accessions_10k) < required_min_10k:
         print(f"⚠️ Not enough filings from recent submissions — falling back to master index.")
         use_fallback = True
         log_metric("fallback_triggered", True)
@@ -1386,6 +1780,11 @@ def parse_filing(
 
     # === FETCH & PARSE RECENT FILINGS ===================================
     # === Filter for required 10-Q's for workflow ===================================
+
+    required_10q_filings = []
+    required_10k_filings = []
+    fallback_10q_candidates = []
+    fallback_10k_candidates = []
 
     # === FILTER FOR REQUIRED 10Q ACCESSIONS ===
     if not use_fallback:
@@ -1443,9 +1842,34 @@ def parse_filing(
 
     # === FETCH 10Q/10K ACCESSIONS FROM MASTER INDEX ===
 
-    if len(accessions_10q) < N_10Q or len(accessions_10k) < N_10K:
+    if use_fallback:
         accessions_10q, accessions_10k = fetch_10q_10k_accessions_from_master(CIK, HEADERS, years_to_check, quarters_to_check)
         print(accessions_10q[:2], accessions_10k[:1])
+
+        # Recompute labels on complete master-index lists, then narrow candidates.
+        accessions_10q = label_10q_accessions(accessions_10q, accessions_10k)
+        accessions_10k = enrich_10k_accessions_with_fiscal_year(accessions_10k)
+
+        fallback_10q_candidates = filter_10q_accessions(accessions_10q, YEAR, QUARTER)
+        fallback_10k_candidates = filter_10k_accessions(accessions_10k, YEAR, QUARTER)
+
+        # Add a bounded recency buffer so mislabeling does not force immediate full-list widening.
+        fallback_10q_cap = max(required_min_10q + 4, 10)
+        fallback_10k_cap = max(required_min_10k + 2, 5)
+        fallback_10q_candidates = _merge_entries_by_accession(
+            fallback_10q_candidates,
+            accessions_10q,
+            max_items=fallback_10q_cap,
+        )
+        fallback_10k_candidates = _merge_entries_by_accession(
+            fallback_10k_candidates,
+            accessions_10k,
+            max_items=fallback_10k_cap,
+        )
+        print(
+            f"📌 Fallback candidate set sizes: {len(fallback_10q_candidates)} 10-Q, "
+            f"{len(fallback_10k_candidates)} 10-K"
+        )
 
 
     # In[103]:
@@ -1478,14 +1902,38 @@ def parse_filing(
         print("\n📕 Processing 10-Ks...")
         results_10k = extract_filing_batch(required_10k_filings, CIK, HEADERS, "10-K")
     
-    else:    
-        print("\n⚠️ Skipping filtered extraction — fallback mode will parse full lists.")
-    
-        print("\n📘 Processing 10-Qs...")
-        results_10q = extract_filing_batch(accessions_10q, CIK, HEADERS, "10-Q")
-    
-        print("\n📕 Processing 10-Ks...")
-        results_10k = extract_filing_batch(accessions_10k, CIK, HEADERS, form_type="10-K")
+    else:
+        print("\n⚠️ Fallback mode: parsing narrowed candidate lists first.")
+
+        print("\n📘 Processing 10-Q candidate subset...")
+        results_10q = extract_filing_batch(fallback_10q_candidates, CIK, HEADERS, "10-Q")
+
+        print("\n📕 Processing 10-K candidate subset...")
+        results_10k = extract_filing_batch(fallback_10k_candidates, CIK, HEADERS, form_type="10-K")
+
+        coverage_ok, coverage_reason = _fallback_coverage_satisfied(
+            results_10q,
+            results_10k,
+            YEAR,
+            QUARTER,
+            FOUR_Q_MODE,
+        )
+        if coverage_ok:
+            print(f"✅ Fallback subset satisfied coverage checks ({coverage_reason}).")
+        else:
+            print(f"⚠️ Fallback subset incomplete ({coverage_reason}) — widening to remaining filings.")
+            remaining_10q = _remaining_entries(accessions_10q, fallback_10q_candidates)
+            remaining_10k = _remaining_entries(accessions_10k, fallback_10k_candidates)
+
+            if remaining_10q:
+                print("\n📘 Processing remaining fallback 10-Qs...")
+                results_10q.extend(extract_filing_batch(remaining_10q, CIK, HEADERS, "10-Q"))
+            if remaining_10k:
+                print("\n📕 Processing remaining fallback 10-Ks...")
+                results_10k.extend(extract_filing_batch(remaining_10k, CIK, HEADERS, form_type="10-K"))
+
+        results_10q = _sort_results_by_accession_order(results_10q, accessions_10q)
+        results_10k = _sort_results_by_accession_order(results_10k, accessions_10k)
 
     # === CALCULATING PROCESSING TIME ===
 
@@ -2007,28 +2455,28 @@ def parse_filing(
         "debug_mode": DEBUG_MODE,
         "FOUR_Q_MODE": FOUR_Q_MODE,
         "CIK": CIK,
-        "target_label": locals().get("target_label"),
-        "annual_label": locals().get("annual_label"),
-        "target_10q": locals().get("target_10q"),
-        "prior_10q": locals().get("prior_10q"),
-        "target_10k": locals().get("target_10k"),
-        "prior_10k": locals().get("prior_10k"),
-        "q1_entry": locals().get("q1_entry"),
-        "q2_entry": locals().get("q2_entry"),
-        "q3_entry": locals().get("q3_entry"),
-        "q1_prior_entry": locals().get("q1_prior_entry"),
-        "q2_prior_entry": locals().get("q2_prior_entry"),
-        "q3_prior_entry": locals().get("q3_prior_entry"),
-        "df_current": locals().get("df_current"),
-        "df_prior": locals().get("df_prior"),
-        "df_current_10k": locals().get("df_current_10k"),
-        "df_prior_10k": locals().get("df_prior_10k"),
-        "df_q1": locals().get("df_q1"),
-        "df_q2": locals().get("df_q2"),
-        "df_q3": locals().get("df_q3"),
-        "df_q1_prior": locals().get("df_q1_prior"),
-        "df_q2_prior": locals().get("df_q2_prior"),
-        "df_q3_prior": locals().get("df_q3_prior"),
-        "negated_tags": set(locals().get("negated_tags", set())),
+        "target_label": target_label,
+        "annual_label": annual_label,
+        "target_10q": target_10q,
+        "prior_10q": prior_10q,
+        "target_10k": target_10k,
+        "prior_10k": prior_10k,
+        "q1_entry": q1_entry,
+        "q2_entry": q2_entry,
+        "q3_entry": q3_entry,
+        "q1_prior_entry": q1_prior_entry,
+        "q2_prior_entry": q2_prior_entry,
+        "q3_prior_entry": q3_prior_entry,
+        "df_current": df_current,
+        "df_prior": df_prior,
+        "df_current_10k": df_current_10k,
+        "df_prior_10k": df_prior_10k,
+        "df_q1": df_q1,
+        "df_q2": df_q2,
+        "df_q3": df_q3,
+        "df_q1_prior": df_q1_prior,
+        "df_q2_prior": df_q2_prior,
+        "df_q3_prior": df_q3_prior,
+        "negated_tags": set(negated_tags),
         "metrics": dict(metrics),
     }

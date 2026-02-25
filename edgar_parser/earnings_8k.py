@@ -2,27 +2,55 @@ import re
 import os
 import json
 import time
+import logging
+import urllib.error
+import urllib.request
 import requests
 from datetime import timedelta, date, datetime, UTC
 from collections import defaultdict
-from .config import HEADERS, REQUEST_DELAY, ANTHROPIC_MODEL_8K, MAX_8K_HTML_BYTES
+from .config import (
+    HEADERS,
+    ANTHROPIC_MODEL_8K,
+    ENABLE_8K_LLM_FALLBACK,
+    MAX_8K_HTML_BYTES,
+    MAX_8K_HTML_BYTES_OPENAI,
+    OPENAI_API_KEY,
+    OPENAI_MODEL_8K,
+)
+from .http_client import get as http_get
 from .utils import lookup_cik_from_ticker, parse_date
 
+logger = logging.getLogger(__name__)
 
-# === Claude API telemetry ===
-# Pricing per million tokens (Sonnet 4, as of 2025)
+# === LLM API telemetry ===
+# Pricing per million tokens
 _CLAUDE_INPUT_COST_PER_M = 3.00
 _CLAUDE_OUTPUT_COST_PER_M = 15.00
+_OPENAI_INPUT_COST_PER_M = 2.50
+_OPENAI_OUTPUT_COST_PER_M = 10.00
 
 
-def log_claude_api(
-    ticker, year, quarter, model, input_tokens, output_tokens, duration_sec, status, error_msg=None
+def log_llm_api(
+    ticker,
+    year,
+    quarter,
+    model,
+    input_tokens,
+    output_tokens,
+    duration_sec,
+    status,
+    error_msg=None,
+    provider="anthropic",
 ):
-    """Log Claude API call metrics to usage_logs/claude_api_log.jsonl."""
-    cost_usd = (
-        (input_tokens / 1_000_000) * _CLAUDE_INPUT_COST_PER_M
-        + (output_tokens / 1_000_000) * _CLAUDE_OUTPUT_COST_PER_M
-    )
+    """Log LLM API call metrics to usage_logs/claude_api_log.jsonl."""
+    if provider == "openai":
+        input_rate = _OPENAI_INPUT_COST_PER_M
+        output_rate = _OPENAI_OUTPUT_COST_PER_M
+    else:
+        provider = "anthropic"
+        input_rate = _CLAUDE_INPUT_COST_PER_M
+        output_rate = _CLAUDE_OUTPUT_COST_PER_M
+    cost_usd = (input_tokens / 1_000_000) * input_rate + (output_tokens / 1_000_000) * output_rate
     record = {
         "timestamp": datetime.now(UTC).isoformat(),
         "ticker": ticker,
@@ -34,6 +62,7 @@ def log_claude_api(
         "duration_sec": round(duration_sec, 2),
         "cost_usd": round(cost_usd, 4),
         "status": status,
+        "provider": provider,
     }
     if error_msg:
         record["error"] = error_msg
@@ -41,12 +70,32 @@ def log_claude_api(
     os.makedirs("usage_logs", exist_ok=True)
     with open("usage_logs/claude_api_log.jsonl", "a") as f:
         f.write(json.dumps(record) + "\n")
+
+
+def log_claude_api(
+    ticker, year, quarter, model, input_tokens, output_tokens, duration_sec, status, error_msg=None
+):
+    """Backward-compatible wrapper for Anthropic log records."""
+    return log_llm_api(
+        ticker,
+        year,
+        quarter,
+        model,
+        input_tokens,
+        output_tokens,
+        duration_sec,
+        status,
+        error_msg,
+        provider="anthropic",
+    )
+
+
 # TODO: n_limit=8 means only the 8 most recent Item 2.02 8-Ks are fetched.
 # Requests for older quarters may fail if the correct 8-K falls outside this
 # window. Consider increasing or making caller-configurable if needed.
 def fetch_recent_8k_accessions(cik, headers, n_limit=8):
     url = f"https://data.sec.gov/submissions/CIK{cik.zfill(10)}.json"
-    r = requests.get(url, headers=headers)
+    r = http_get(url, headers=headers)
     r.raise_for_status()
     filings = r.json()["filings"]["recent"]
 
@@ -82,9 +131,8 @@ def fetch_recent_8k_accessions(cik, headers, n_limit=8):
 def fetch_8k_exhibit(cik, accession, headers):
     acc_nodash = accession.replace("-", "")
     index_url = f"https://www.sec.gov/Archives/edgar/data/{int(cik)}/{acc_nodash}/index.json"
-    time.sleep(REQUEST_DELAY)
     try:
-        r = requests.get(index_url, headers=headers)
+        r = http_get(index_url, headers=headers, rate_limited=True)
         r.raise_for_status()
     except requests.RequestException:
         return None, None
@@ -139,9 +187,8 @@ def fetch_8k_exhibit(cik, accession, headers):
         exhibit_name = max(htm_files, key=lambda x: x[1])[0]
 
     exhibit_url = f"https://www.sec.gov/Archives/edgar/data/{int(cik)}/{acc_nodash}/{exhibit_name}"
-    time.sleep(REQUEST_DELAY)
     try:
-        r = requests.get(exhibit_url, headers=headers)
+        r = http_get(exhibit_url, headers=headers, rate_limited=True)
         r.raise_for_status()
     except requests.RequestException:
         return None, None
@@ -345,37 +392,225 @@ def _strip_html_attrs(html_text):
     return re.sub(r"<(\/?[a-zA-Z][a-zA-Z0-9]*)\b[^>]*\/?>", r"<\1>", html_text)
 
 
-def extract_facts_from_8k(html_content, ticker, year, quarter, full_year_mode):
-    try:
-        from anthropic import Anthropic
-    except ImportError as e:
-        raise ImportError(
-            "The 'anthropic' package is required for 8-K extraction. "
-            "Install with: pip install edgar-parser[llm]"
-        ) from e
+def _truncate_8k_html(html, max_bytes):
+    if len(html.encode("utf-8")) <= max_bytes:
+        return html
 
-    # 1. Preprocess HTML
-    html = re.sub(
-        r"<(style|script|head)[^>]*>.*?</\1>", "", html_content, flags=re.DOTALL | re.IGNORECASE
+    tables = re.findall(
+        r"(.{0,200}<table>.*?</table>.{0,200})",
+        html,
+        flags=re.DOTALL | re.IGNORECASE,
     )
-    # Strip all HTML attributes (style, class, etc.) -- biggest size reducer
+    if tables:
+        html = "\n\n".join(tables)
+
+    html_bytes = html.encode("utf-8")
+    if len(html_bytes) <= max_bytes:
+        return html
+
+    trimmed = html_bytes[:max_bytes].decode("utf-8", errors="ignore")
+    return trimmed.rsplit(" ", 1)[0] if " " in trimmed else trimmed
+
+
+def _preprocess_8k_html(html_content):
+    html = re.sub(
+        r"<(style|script|head)[^>]*>.*?</\1>",
+        "",
+        html_content,
+        flags=re.DOTALL | re.IGNORECASE,
+    )
     html = _strip_html_attrs(html)
-    # Remove empty tags and collapse whitespace
     html = re.sub(r"<(td|th|span|div|p)>\s*</\1>", "", html, flags=re.IGNORECASE)
     html = re.sub(r"\s{2,}", " ", html)
+    return _truncate_8k_html(html, MAX_8K_HTML_BYTES)
 
-    if len(html.encode("utf-8")) > MAX_8K_HTML_BYTES:
-        # Extract just tables with surrounding context
-        tables = re.findall(
-            r"(.{0,200}<table>.*?</table>.{0,200})",
-            html,
-            flags=re.DOTALL | re.IGNORECASE,
-        )
-        if tables:
-            html = "\n\n".join(tables)
+
+def _status_code_from_error(exc):
+    status_code = getattr(exc, "status_code", None)
+    if isinstance(status_code, int):
+        return status_code
+    response = getattr(exc, "response", None)
+    response_status = getattr(response, "status_code", None)
+    return response_status if isinstance(response_status, int) else None
+
+
+def _is_anthropic_server_error(exc, anthropic_errors=None):
+    anthropic_errors = anthropic_errors or {}
+    overloaded = anthropic_errors.get("OverloadedError")
+    internal = anthropic_errors.get("InternalServerError")
+    api_status = anthropic_errors.get("APIStatusError")
+    if isinstance(overloaded, type) and isinstance(exc, overloaded):
+        return True
+    if isinstance(internal, type) and isinstance(exc, internal):
+        return True
+    if isinstance(api_status, type) and isinstance(exc, api_status):
+        status_code = _status_code_from_error(exc)
+        return isinstance(status_code, int) and status_code >= 500
+    if isinstance(exc, urllib.error.HTTPError):
+        return exc.code >= 500
+    name = exc.__class__.__name__
+    if name in {"OverloadedError", "InternalServerError"}:
+        return True
+    if name == "APIStatusError":
+        status_code = _status_code_from_error(exc)
+        return isinstance(status_code, int) and status_code >= 500
+    return False
+
+
+def _is_retriable_error(exc, anthropic_errors=None):
+    if isinstance(exc, (ValueError, TypeError, KeyError)):
+        return False
+    if _is_anthropic_server_error(exc, anthropic_errors):
+        return True
+
+    anthropic_errors = anthropic_errors or {}
+    for name in ("RateLimitError", "APIConnectionError", "AuthenticationError"):
+        error_type = anthropic_errors.get(name)
+        if isinstance(error_type, type) and isinstance(exc, error_type):
+            return True
+    if isinstance(exc, urllib.error.HTTPError):
+        return exc.code >= 500
+
+    return exc.__class__.__name__ in {
+        "RateLimitError",
+        "APIConnectionError",
+        "AuthenticationError",
+    }
+
+
+def _safe_usage_int(value):
+    try:
+        return max(int(value or 0), 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _call_openai(prompt, html, model):
+    """Call OpenAI chat completions API. Returns (response_text, input_tokens, output_tokens)."""
+    if not OPENAI_API_KEY:
+        raise ValueError("OPENAI_API_KEY is not set")
+
+    html_payload = _truncate_8k_html(html, MAX_8K_HTML_BYTES_OPENAI)
+    payload = {
+        "model": model,
+        "temperature": 0,
+        "max_completion_tokens": 8192,
+        "response_format": {"type": "json_object"},
+        "messages": [
+            {"role": "system", "content": prompt},
+            {"role": "user", "content": html_payload},
+        ],
+    }
+    req = urllib.request.Request(
+        "https://api.openai.com/v1/chat/completions",
+        data=json.dumps(payload).encode("utf-8"),
+        method="POST",
+        headers={
+            "Authorization": f"Bearer {OPENAI_API_KEY}",
+            "Content-Type": "application/json",
+        },
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=120) as resp:
+            body = json.loads(resp.read().decode("utf-8"))
+    except urllib.error.HTTPError as exc:
+        detail_raw = exc.read().decode("utf-8", errors="ignore")
+        detail = detail_raw
+        if detail_raw:
+            try:
+                parsed_detail = json.loads(detail_raw)
+                err = parsed_detail.get("error") if isinstance(parsed_detail, dict) else None
+                if isinstance(err, dict):
+                    detail = err.get("message") or detail_raw
+            except json.JSONDecodeError:
+                pass
+        raise ValueError(f"OpenAI API HTTP {exc.code}: {detail or exc.reason}") from exc
+    except urllib.error.URLError as exc:
+        raise ValueError(f"OpenAI API connection error: {exc.reason}") from exc
+
+    choices = body.get("choices") if isinstance(body, dict) else None
+    if not isinstance(choices, list) or not choices:
+        raise ValueError("OpenAI API returned no choices")
+
+    message = choices[0].get("message") if isinstance(choices[0], dict) else None
+    content = message.get("content") if isinstance(message, dict) else None
+    if isinstance(content, str):
+        raw_text = content.strip()
+    elif isinstance(content, list):
+        parts = []
+        for item in content:
+            if isinstance(item, dict):
+                text_part = item.get("text")
+                if isinstance(text_part, str):
+                    parts.append(text_part)
+            elif isinstance(item, str):
+                parts.append(item)
+        raw_text = "".join(parts).strip()
+    else:
+        raise ValueError("OpenAI API returned unexpected content format")
+    if not raw_text:
+        raise ValueError("OpenAI API returned empty response content")
+
+    usage = body.get("usage") if isinstance(body, dict) else {}
+    usage_map = usage if isinstance(usage, dict) else {}
+    input_tokens = _safe_usage_int(usage_map.get("prompt_tokens"))
+    output_tokens = _safe_usage_int(usage_map.get("completion_tokens"))
+    return raw_text, input_tokens, output_tokens
+
+
+def _parse_raw_facts(raw_text, ticker, year, quarter, provider_name):
+    cleaned = raw_text.strip()
+    if cleaned.startswith("```"):
+        cleaned = re.sub(r"^```\w*\n?", "", cleaned)
+        cleaned = re.sub(r"\n?```$", "", cleaned)
+
+    try:
+        raw_facts = json.loads(cleaned)
+    except json.JSONDecodeError as exc:
+        bracket_match = re.search(r"\[.*\]", cleaned, re.DOTALL)
+        if bracket_match:
+            try:
+                raw_facts = json.loads(bracket_match.group())
+            except json.JSONDecodeError as bracket_exc:
+                raise ValueError(
+                    f"{provider_name} returned invalid JSON for {ticker} Q{quarter} {year}: {bracket_exc}. "
+                    f"First 200 chars: {cleaned[:200]}"
+                ) from bracket_exc
         else:
-            # No tables found — fallback to truncated original HTML
-            html = html[:MAX_8K_HTML_BYTES].rsplit(" ", 1)[0]  # truncate at word boundary
+            raise ValueError(
+                f"{provider_name} returned invalid JSON for {ticker} Q{quarter} {year}: {exc}. "
+                f"First 200 chars: {cleaned[:200]}"
+            ) from exc
+
+    if not isinstance(raw_facts, list):
+        raise ValueError(
+            f"{provider_name} returned {type(raw_facts).__name__} instead of list for {ticker} Q{quarter} {year}. "
+            f"First 200 chars: {cleaned[:200]}"
+        )
+    return raw_facts
+
+
+def extract_facts_from_8k(html_content, ticker, year, quarter, full_year_mode):
+    anthropic_available = False
+    anthropic_error_types = {}
+    Anthropic = None
+    try:
+        import anthropic as anthropic_module
+
+        Anthropic = anthropic_module.Anthropic
+        anthropic_available = True
+        anthropic_error_types = {
+            "OverloadedError": getattr(anthropic_module, "OverloadedError", None),
+            "InternalServerError": getattr(anthropic_module, "InternalServerError", None),
+            "RateLimitError": getattr(anthropic_module, "RateLimitError", None),
+            "APIConnectionError": getattr(anthropic_module, "APIConnectionError", None),
+            "AuthenticationError": getattr(anthropic_module, "AuthenticationError", None),
+            "APIStatusError": getattr(anthropic_module, "APIStatusError", None),
+        }
+    except ImportError:
+        anthropic_available = False
+
+    html = _preprocess_8k_html(html_content)
 
     # 2. Build prompt
     period = f"FY {year}" if full_year_mode else f"Q{quarter} {year}"
@@ -407,74 +642,207 @@ scale factor. Use null for missing values.
 
 Output ONLY the JSON array, no other text."""
 
-    # 3. Call Claude API
-    client = Anthropic()  # uses ANTHROPIC_API_KEY env var
+    def _parse_and_postprocess(
+        provider_name, model, input_tokens, output_tokens, duration, raw_text, provider
+    ):
+        try:
+            raw_facts = _parse_raw_facts(raw_text, ticker, year, quarter, provider_name)
+        except ValueError as exc:
+            status = "invalid_type" if "instead of list" in str(exc) else "invalid_json"
+            log_llm_api(
+                ticker,
+                year,
+                quarter,
+                model,
+                input_tokens,
+                output_tokens,
+                duration,
+                status,
+                str(exc),
+                provider=provider,
+            )
+            raise
+        log_llm_api(
+            ticker,
+            year,
+            quarter,
+            model,
+            input_tokens,
+            output_tokens,
+            duration,
+            "success",
+            provider=provider,
+        )
+        return _postprocess_facts(raw_facts)
+
+    if anthropic_available:
+        client = Anthropic()  # uses ANTHROPIC_API_KEY env var
+        anthropic_error = None
+
+        for attempt in range(2):
+            start_time = time.time()
+            try:
+                response = client.messages.create(
+                    model=ANTHROPIC_MODEL_8K,
+                    max_tokens=8192,
+                    messages=[
+                        {
+                            "role": "user",
+                            "content": [
+                                {"type": "text", "text": prompt},
+                                {"type": "text", "text": html},
+                            ],
+                        }
+                    ],
+                )
+                duration = time.time() - start_time
+                input_tokens = getattr(response.usage, "input_tokens", 0)
+                output_tokens = getattr(response.usage, "output_tokens", 0)
+
+                if not response.content:
+                    err = ValueError(
+                        f"Anthropic API returned empty response for {ticker} Q{quarter} {year}"
+                    )
+                    log_claude_api(
+                        ticker,
+                        year,
+                        quarter,
+                        ANTHROPIC_MODEL_8K,
+                        input_tokens,
+                        output_tokens,
+                        duration,
+                        "empty_response",
+                        str(err),
+                    )
+                    raise err
+
+                content_block = response.content[0] if response.content else None
+                raw_text = getattr(content_block, "text", "") if content_block else ""
+                if not isinstance(raw_text, str) or not raw_text.strip():
+                    err = ValueError(
+                        f"Anthropic API returned empty response for {ticker} Q{quarter} {year}"
+                    )
+                    log_claude_api(
+                        ticker,
+                        year,
+                        quarter,
+                        ANTHROPIC_MODEL_8K,
+                        input_tokens,
+                        output_tokens,
+                        duration,
+                        "empty_response",
+                        str(err),
+                    )
+                    raise err
+
+                return _parse_and_postprocess(
+                    "Claude",
+                    ANTHROPIC_MODEL_8K,
+                    input_tokens,
+                    output_tokens,
+                    duration,
+                    raw_text,
+                    provider="anthropic",
+                )
+            except ValueError as exc:
+                anthropic_error = exc
+                break
+            except Exception as exc:
+                anthropic_error = exc
+                duration = time.time() - start_time
+                log_claude_api(
+                    ticker,
+                    year,
+                    quarter,
+                    ANTHROPIC_MODEL_8K,
+                    0,
+                    0,
+                    duration,
+                    "error",
+                    str(exc),
+                )
+                if attempt == 0 and _is_anthropic_server_error(exc, anthropic_error_types):
+                    time.sleep(2)
+                    continue
+                break
+
+        if anthropic_error and not _is_retriable_error(anthropic_error, anthropic_error_types):
+            raise anthropic_error
+    else:
+        anthropic_error = ImportError("anthropic package is unavailable")
+
+    fallback_enabled = ENABLE_8K_LLM_FALLBACK
+    has_openai_key = bool(OPENAI_API_KEY)
+    if not fallback_enabled or not has_openai_key:
+        if anthropic_available and anthropic_error is not None:
+            if not fallback_enabled:
+                logger.warning(
+                    "8-K LLM fallback disabled; re-raising Anthropic error for %s Q%s %s",
+                    ticker,
+                    quarter,
+                    year,
+                )
+            elif not has_openai_key:
+                logger.warning(
+                    "8-K LLM fallback requested but OPENAI_API_KEY is missing for %s Q%s %s",
+                    ticker,
+                    quarter,
+                    year,
+                )
+            raise ValueError(
+                f"Anthropic API error for {ticker} Q{quarter} {year}: "
+                f"{type(anthropic_error).__name__}: {anthropic_error}"
+            ) from anthropic_error
+        raise ValueError("Neither anthropic nor OpenAI fallback is available for 8-K extraction")
+
     start_time = time.time()
     try:
-        response = client.messages.create(
-            model=ANTHROPIC_MODEL_8K,
-            max_tokens=8192,
-            messages=[
-                {
-                    "role": "user",
-                    "content": [
-                        {"type": "text", "text": prompt},
-                        {"type": "text", "text": html},
-                    ],
-                }
-            ],
-        )
-    except Exception as e:
+        raw_text, input_tokens, output_tokens = _call_openai(prompt, html, OPENAI_MODEL_8K)
+    except ValueError as openai_error:
         duration = time.time() - start_time
-        log_claude_api(ticker, year, quarter, ANTHROPIC_MODEL_8K, 0, 0, duration, "error", str(e))
-        raise ValueError(
-            f"Anthropic API error for {ticker} Q{quarter} {year}: {type(e).__name__}: {e}"
+        log_llm_api(
+            ticker,
+            year,
+            quarter,
+            OPENAI_MODEL_8K,
+            0,
+            0,
+            duration,
+            "error",
+            str(openai_error),
+            provider="openai",
         )
+        if anthropic_available and anthropic_error is not None:
+            raise ValueError(
+                f"Anthropic and OpenAI fallback both failed for {ticker} Q{quarter} {year}: "
+                f"anthropic={type(anthropic_error).__name__}: {anthropic_error}; "
+                f"openai={openai_error}"
+            ) from openai_error
+        raise ValueError(
+            f"OpenAI fallback failed for {ticker} Q{quarter} {year}: {openai_error}"
+        ) from openai_error
 
     duration = time.time() - start_time
-    input_tokens = getattr(response.usage, "input_tokens", 0)
-    output_tokens = getattr(response.usage, "output_tokens", 0)
-
-    if not response.content:
-        log_claude_api(ticker, year, quarter, ANTHROPIC_MODEL_8K, input_tokens, output_tokens, duration, "empty_response")
-        raise ValueError(f"Anthropic API returned empty response for {ticker} Q{quarter} {year}")
-    raw_text = response.content[0].text.strip()
-
-    # 4. Parse JSON -- handle markdown fencing if Claude adds it
-    if raw_text.startswith("```"):
-        raw_text = re.sub(r"^```\w*\n?", "", raw_text)
-        raw_text = re.sub(r"\n?```$", "", raw_text)
     try:
-        raw_facts = json.loads(raw_text)
-    except json.JSONDecodeError as e:
-        # Try to salvage: find the first [ ... ] in the response
-        bracket_match = re.search(r"\[.*\]", raw_text, re.DOTALL)
-        if bracket_match:
-            try:
-                raw_facts = json.loads(bracket_match.group())
-            except json.JSONDecodeError:
-                log_claude_api(ticker, year, quarter, ANTHROPIC_MODEL_8K, input_tokens, output_tokens, duration, "invalid_json")
-                raise ValueError(
-                    f"Claude returned invalid JSON for {ticker} Q{quarter} {year}: {e}. "
-                    f"First 200 chars: {raw_text[:200]}"
-                )
-        else:
-            log_claude_api(ticker, year, quarter, ANTHROPIC_MODEL_8K, input_tokens, output_tokens, duration, "invalid_json")
-            raise ValueError(
-                f"Claude returned invalid JSON for {ticker} Q{quarter} {year}: {e}. "
-                f"First 200 chars: {raw_text[:200]}"
-            )
-
-    if not isinstance(raw_facts, list):
-        log_claude_api(ticker, year, quarter, ANTHROPIC_MODEL_8K, input_tokens, output_tokens, duration, "invalid_type")
-        raise ValueError(
-            f"Claude returned {type(raw_facts).__name__} instead of list for {ticker} Q{quarter} {year}. "
-            f"First 200 chars: {raw_text[:200]}"
+        return _parse_and_postprocess(
+            "OpenAI",
+            OPENAI_MODEL_8K,
+            input_tokens,
+            output_tokens,
+            duration,
+            raw_text,
+            provider="openai",
         )
-
-    # 5. Post-process into EdgarFact schema and log success
-    log_claude_api(ticker, year, quarter, ANTHROPIC_MODEL_8K, input_tokens, output_tokens, duration, "success")
-    return _postprocess_facts(raw_facts)
+    except ValueError as openai_error:
+        if anthropic_available and anthropic_error is not None:
+            raise ValueError(
+                f"Anthropic and OpenAI fallback both failed for {ticker} Q{quarter} {year}: "
+                f"anthropic={type(anthropic_error).__name__}: {anthropic_error}; "
+                f"openai={openai_error}"
+            ) from openai_error
+        raise ValueError(
+            f"OpenAI fallback failed for {ticker} Q{quarter} {year}: {openai_error}"
+        ) from openai_error
 
 
 def _coerce_numeric(val):
