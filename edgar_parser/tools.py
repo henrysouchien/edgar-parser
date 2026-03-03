@@ -24,10 +24,14 @@ if os.path.exists(_tickers_file):
 
 def _validate_ticker(ticker: str) -> str | None:
     """Return error message if ticker is invalid, else None."""
-    if not ticker:
+    ticker_normalized = "".join(
+        ch
+        for ch in str(ticker or "").strip().upper().replace(".", "-")
+        if ch.isalnum() or ch == "-"
+    )
+    if not ticker_normalized:
         return "Missing required parameter: ticker"
-    ticker_upper = ticker.strip().upper()
-    if _VALID_TICKERS and ticker_upper not in _VALID_TICKERS:
+    if _VALID_TICKERS and ticker_normalized not in _VALID_TICKERS:
         return f"Invalid or unsupported ticker: {ticker}"
     return None
 
