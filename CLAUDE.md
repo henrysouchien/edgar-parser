@@ -15,7 +15,7 @@ NO COWBOY CODING. This codebase has carefully designed layers and abstractions. 
 ---
 
 
-NEVER edit files in any `-dist` package directory (app-platform-dist, brokerage-connect-dist, claude-gateway-dist, finance-cli-dist, fmp-mcp-dist, ibkr-mcp-dist, portfolio-risk-engine-dist, taskflow-agent-dist, web-app-platform-dist). These are synced deployment repos — always edit the source repo instead. If you need to change code that lives in a -dist package, identify which source repo owns it and make changes there.
+NEVER edit files in any `-dist` package directory (app-platform-dist, brokerage-connect-dist, agent-gateway-dist, finance-cli-dist, fmp-mcp-dist, ibkr-mcp-dist, portfolio-risk-engine-dist, taskflow-agent-dist, web-app-platform-dist). These are synced deployment repos — always edit the source repo instead. If you need to change code that lives in a -dist package, identify which source repo owns it and make changes there.
 
 NEVER run `git checkout -- <files>`, `git checkout .`, `git checkout HEAD`, `git restore .`, `git reset --hard`, `git clean -f`, or ANY command that discards uncommitted changes. NO EXCEPTIONS. Multiple sessions may be running in parallel. If Codex or any tool modifies unexpected files, TELL the user which files and ASK what to do — do NOT revert them.
 
