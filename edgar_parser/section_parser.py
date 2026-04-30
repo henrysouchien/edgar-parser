@@ -27,12 +27,12 @@ def _flex(word: str) -> str:
 
 SECTIONS_10K = {
     "item_1": rf"Item\s*1{_SEP}\s*{_flex('Business')}",
-    "item_1a": rf"Item\s*1A{_SEP}\s*{_flex('Risk')}\s+{_flex('Factors')}",
-    "item_1b": rf"Item\s*1B{_SEP}\s*{_flex('Unresolved')}\s+{_flex('Staff')}\s+{_flex('Comments')}",
+    "item_1a": rf"Item\s*1[\.\s]*A{_SEP}\s*{_flex('Risk')}\s+{_flex('Factors')}",
+    "item_1b": rf"Item\s*1[\.\s]*B{_SEP}\s*{_flex('Unresolved')}\s+{_flex('Staff')}\s+{_flex('Comments')}",
     "item_2": rf"Item\s*2{_SEP}\s*{_flex('Properties')}",
     "item_3": rf"Item\s*3{_SEP}\s*{_flex('Legal')}\s+{_flex('Proceedings')}",
     "item_7": rf"Item\s*7{_SEP}\s*{_flex('Management')}.{{0,10}}{_flex('Discussion')}",
-    "item_7a": rf"Item\s*7A{_SEP}\s*{_flex('Quantitative')}\s+.*{_flex('Qualitative')}",
+    "item_7a": rf"Item\s*7[\.\s]*A{_SEP}\s*{_flex('Quantitative')}\s+.*{_flex('Qualitative')}",
     "item_8": rf"Item\s*8{_SEP}\s*{_flex('Financial')}\s+{_flex('Statements')}",
 }
 
@@ -42,7 +42,7 @@ SECTIONS_10Q = {
     "part1_item3": rf"(?:Part\s*I\s*[\.\:\-\u2013\u2014]*\s*)?Item\s*3{_SEP}\s*{_flex('Quantitative')}",
     "part1_item4": rf"(?:Part\s*I\s*[\.\:\-\u2013\u2014]*\s*)?Item\s*4{_SEP}\s*{_flex('Controls')}\s+.*{_flex('Procedures')}",
     "part2_item1": rf"(?:Part\s*II\s*[\.\:\-\u2013\u2014]*\s*)?Item\s*1{_SEP}\s*{_flex('Legal')}\s+{_flex('Proceedings')}",
-    "part2_item1a": rf"(?:Part\s*II\s*[\.\:\-\u2013\u2014]*\s*)?Item\s*1A{_SEP}\s*{_flex('Risk')}\s+{_flex('Factors')}",
+    "part2_item1a": rf"(?:Part\s*II\s*[\.\:\-\u2013\u2014]*\s*)?Item\s*1[\.\s]*A{_SEP}\s*{_flex('Risk')}\s+{_flex('Factors')}",
 }
 
 SECTION_ORDER_10K = ["item_1", "item_1a", "item_1b", "item_2", "item_3", "item_7", "item_7a", "item_8"]
@@ -76,6 +76,28 @@ _BODY_REF_PREFIXES = (
     "discussed in ",
     "pursuant to ",
 )
+
+_LIKELY_PAGE_NUMBER_RE = re.compile(r"(?:\s+|\.)(?:[ivxlcdm]+|\d{1,4})\s*$", re.IGNORECASE)
+
+_TOC_VARIANTS_10K = {
+    "item_1": rf"\b{_flex('Business')}\b",
+    "item_1a": rf"\b{_flex('Risk')}\s+{_flex('Factors')}\b",
+    "item_1b": rf"\b{_flex('Unresolved')}\s+{_flex('Staff')}\s+{_flex('Comments')}\b",
+    "item_2": rf"\b{_flex('Properties')}\b",
+    "item_3": rf"\b{_flex('Legal')}\s+{_flex('Proceedings')}\b",
+    "item_7": rf"\b{_flex('Management')}.{{0,30}}{_flex('Discussion')}\b",
+    "item_7a": rf"\b{_flex('Quantitative')}\s+.*{_flex('Qualitative')}\b",
+    "item_8": rf"\b{_flex('Financial')}\s+{_flex('Statements')}\b",
+}
+
+_TOC_VARIANTS_10Q = {
+    "part1_item1": rf"\b{_flex('Financial')}\s+{_flex('Statements')}\b",
+    "part1_item2": rf"\b{_flex('Management')}.{{0,30}}{_flex('Discussion')}\b",
+    "part1_item3": rf"\b{_flex('Quantitative')}\s+.*{_flex('Qualitative')}\b",
+    "part1_item4": rf"\b{_flex('Controls')}\s+.*{_flex('Procedures')}\b",
+    "part2_item1": rf"\b{_flex('Legal')}\s+{_flex('Proceedings')}\b",
+    "part2_item1a": rf"\b{_flex('Risk')}\s+{_flex('Factors')}\b",
+}
 
 FILE_OUTPUT_DIR = Path(__file__).resolve().parent.parent / "exports" / "file_output"
 MAX_BASENAME = 180
@@ -218,6 +240,167 @@ def parse_filing_sections(html_content: bytes | str, filing_type: str) -> dict:
     }
 
 
+def _normalize_block_text(element: Tag) -> str:
+    return re.sub(r"\s+", " ", element.get_text(" ", strip=True)).strip()
+
+
+def _strip_toc_page_number(text: str) -> str:
+    previous = ""
+    cleaned = re.sub(r"\s+", " ", text or "").strip()
+    while cleaned and cleaned != previous:
+        previous = cleaned
+        cleaned = _LIKELY_PAGE_NUMBER_RE.sub("", cleaned).strip()
+    return cleaned
+
+
+def _toc_variant_patterns(filing_type: str) -> dict[str, str]:
+    return _TOC_VARIANTS_10K if filing_type == "10-K" else _TOC_VARIANTS_10Q
+
+
+def _match_section_keys(
+    text: str,
+    compiled: dict[str, re.Pattern],
+    filing_type: str,
+    *,
+    allow_toc_variants: bool = False,
+) -> list[str]:
+    normalized = re.sub(r"\s+", " ", text or "").strip()
+    if not normalized or len(normalized.split()) > 40:
+        return []
+
+    matches = [key for key, pattern in compiled.items() if pattern.search(normalized)]
+    if matches or not allow_toc_variants:
+        return matches
+
+    variant_compiled = {
+        key: re.compile(pattern, re.IGNORECASE)
+        for key, pattern in _toc_variant_patterns(filing_type).items()
+    }
+    return [key for key, pattern in variant_compiled.items() if pattern.search(normalized)]
+
+
+def _match_body_header_keys(text: str, compiled: dict[str, re.Pattern]) -> list[str]:
+    """Match only section labels that appear at the start of a body heading."""
+    normalized = re.sub(r"\s+", " ", text or "").strip()
+    keys = []
+    for key, pattern in compiled.items():
+        match = pattern.search(normalized)
+        if match and match.start() <= 2:
+            keys.append(key)
+    return keys
+
+
+def _build_anchor_target_index(soup: BeautifulSoup) -> dict[str, Tag]:
+    targets: dict[str, Tag] = {}
+    for tag in soup.find_all(True):
+        for attr in ("id", "name"):
+            value = tag.get(attr)
+            if not isinstance(value, str) or not value:
+                continue
+            targets.setdefault(value, tag)
+    return targets
+
+
+def _is_in_large_anchor_table(element: Tag) -> bool:
+    table = element if element.name == "table" else element.find_parent("table")
+    if table is None:
+        return False
+    return len(table.find_all("a", href=re.compile(r"^#"))) > 5
+
+
+def _is_probable_toc_anchor(anchor: Tag, target: Tag, tag_positions: dict[int, int]) -> bool:
+    anchor_position = tag_positions.get(id(anchor))
+    target_position = tag_positions.get(id(target))
+    if anchor_position is None or target_position is None:
+        return False
+    if target_position <= anchor_position:
+        return False
+    if _is_in_large_anchor_table(target):
+        return False
+    return True
+
+
+def _candidate_texts_for_anchor(anchor: Tag) -> list[str]:
+    texts = []
+    link_text = _normalize_block_text(anchor)
+    if link_text:
+        texts.append(link_text)
+
+    row = anchor.find_parent("tr")
+    if row is not None:
+        row_text = _normalize_block_text(row)
+        if row_text:
+            texts.append(row_text)
+            stripped = _strip_toc_page_number(row_text)
+            if stripped and stripped != row_text:
+                texts.append(stripped)
+
+    deduped = []
+    seen = set()
+    for text in texts:
+        if text in seen:
+            continue
+        seen.add(text)
+        deduped.append(text)
+    return deduped
+
+
+def _find_anchor_section_headers(
+    soup: BeautifulSoup,
+    filing_type: str,
+    compiled: dict[str, re.Pattern],
+    existing_keys: set[str],
+) -> list[dict]:
+    """
+    Resolve TOC-style anchors to body targets for filings whose body headings
+    omit the full "Item N" text. This is common in large financial issuers.
+    """
+    target_index = _build_anchor_target_index(soup)
+    all_tags = [node for node in soup.descendants if isinstance(node, Tag)]
+    tag_positions = {id(tag): idx for idx, tag in enumerate(all_tags)}
+
+    candidates_by_key: dict[str, dict] = {}
+    for anchor in soup.find_all("a", href=re.compile(r"^#")):
+        href = anchor.get("href")
+        if not isinstance(href, str) or len(href) <= 1:
+            continue
+
+        target = target_index.get(href[1:])
+        if target is None or not _is_probable_toc_anchor(anchor, target, tag_positions):
+            continue
+
+        target_position = tag_positions.get(id(target))
+        if target_position is None:
+            continue
+
+        allow_variants = _is_in_large_anchor_table(anchor)
+        for candidate_text in _candidate_texts_for_anchor(anchor):
+            keys = _match_section_keys(
+                candidate_text,
+                compiled,
+                filing_type,
+                allow_toc_variants=allow_variants,
+            )
+            if not keys:
+                continue
+
+            for key in keys:
+                if key in existing_keys:
+                    continue
+                current = candidates_by_key.get(key)
+                if current is not None and current["position"] <= target_position:
+                    continue
+                candidates_by_key[key] = {
+                    "key": key,
+                    "element": target,
+                    "header_text": _strip_toc_page_number(candidate_text),
+                    "position": target_position,
+                }
+            break
+
+    return sorted(candidates_by_key.values(), key=lambda header: header["position"])
+
+
 def find_section_headers(soup: BeautifulSoup, filing_type: str) -> list[dict]:
     """
     Find section header elements in the parsed HTML document.
@@ -238,22 +421,22 @@ def find_section_headers(soup: BeautifulSoup, filing_type: str) -> list[dict]:
         tag = text_node.parent
         if not isinstance(tag, Tag):
             continue
-        if tag.name in ("script", "style", "noscript"):
+        if tag.name in ("script", "style", "noscript", "html", "body", "table", "tbody", "thead", "tfoot"):
             continue
 
         # Check the parent block element's full text to handle headers
         # split across multiple <span> siblings (common in MSFT, JPM, etc.)
-        block = tag.find_parent(["p", "div", "h1", "h2", "h3", "h4", "h5", "h6"]) or tag
+        block = tag.find_parent(["p", "div", "h1", "h2", "h3", "h4", "h5", "h6", "tr"]) or tag
         block_id = id(block)
         if block_id in checked_blocks:
             continue
         checked_blocks.add(block_id)
 
-        text = re.sub(r"\s+", " ", block.get_text(" ", strip=True)).strip()
+        text = _normalize_block_text(block)
         if not text:
             continue
 
-        if len(text.split()) > 15:
+        if len(text.split()) > 30:
             continue
 
         text_lower = text.lower()
@@ -276,18 +459,17 @@ def find_section_headers(soup: BeautifulSoup, filing_type: str) -> list[dict]:
         # check at block level, TOC entries are caught by table/anchor
         # filters; the clustering guard here is defense-in-depth.
         container = block
-        for key, pattern in compiled.items():
-            if pattern.search(text):
-                raw_matches.append(
-                    {
-                        "key": key,
-                        "element": block,
-                        "header_text": text,
-                        "position": position,
-                        "container_id": id(container),
-                    }
-                )
-                break
+        keys = _match_body_header_keys(text, compiled)
+        if keys:
+            raw_matches.append(
+                {
+                    "key": keys[0],
+                    "element": block,
+                    "header_text": text,
+                    "position": position,
+                    "container_id": id(container),
+                }
+            )
 
     container_counts = {}
     for match in raw_matches:
@@ -313,6 +495,14 @@ def find_section_headers(soup: BeautifulSoup, filing_type: str) -> list[dict]:
             }
         )
 
+    deduped.extend(
+        _find_anchor_section_headers(
+            soup,
+            filing_type,
+            compiled,
+            existing_keys=seen_keys,
+        )
+    )
     deduped.sort(key=lambda x: x["position"])
     return deduped
 
