@@ -1,10 +1,34 @@
 # edgar-parser
 
-Structured financial data from SEC EDGAR filings.
+Open-source SEC filing parser for local Python workflows.
 
-Give your Python application access to income statements, balance sheets, cash flows, and qualitative sections from 10-Q, 10-K, and 8-K filings — parsed directly from SEC EDGAR with no third-party data vendor required.
+`edgar-parser` is the free parser engine behind the EdgarParser stack. It reads
+public SEC EDGAR filings directly and turns 10-K, 10-Q, and selected 8-K content
+into structured financial facts and filing sections without a market-data vendor.
 
-This isn't a raw EDGAR scraper. The library handles XBRL namespace resolution, fiscal period matching, current vs. prior period alignment, sign normalization, and fuzzy metric lookup — so you get clean, analysis-ready data.
+Use this package when you want local, self-hosted parsing in Python. If you want
+the hosted API, prewarmed cache, MCP server for agents, concept registry,
+operational KPI extraction, or citation-oriented evidence tools, use
+[EdgarParser](https://edgarparser.com) and the
+[hosted documentation](https://docs.edgarparser.com).
+
+This is not a raw EDGAR scraper. The library handles XBRL namespace resolution,
+fiscal period matching, current vs. prior period alignment, sign normalization,
+and fuzzy metric lookup so you get analysis-ready data from SEC filings.
+
+## Open engine vs. hosted product
+
+| Need | Use |
+|------|-----|
+| Local Python parsing of 10-K/10-Q XBRL facts | `edgar-parser` |
+| Local qualitative section parsing from 10-K/10-Q filings | `edgar-parser` |
+| Optional 8-K earnings-release extraction with your own LLM keys | `edgar-parser[llm]` |
+| Hosted API with auth, rate limits, and prewarmed filing caches | [edgarparser.com](https://edgarparser.com) |
+| MCP tools for Claude Desktop, Cursor, and other agents | [`edgar-mcp`](https://github.com/henrysouchien/edgar-mcp) |
+| Concept registry, operational KPI extraction, langextract spans, grounded evidence, and richer agent workflows | [Hosted API docs](https://docs.edgarparser.com/tools) |
+
+The public package stays focused on the parser engine. Hosted product features
+ship through the API and MCP surfaces.
 
 ## What it does
 
@@ -94,6 +118,17 @@ print(matched.head())
 - Optional: `ANTHROPIC_API_KEY` environment variable for 8-K extraction
 - Optional: `OPENAI_API_KEY` environment variable for 8-K fallback when Anthropic API is unavailable
 
+## Release policy
+
+`edgar-parser` 0.3.x receives bug fixes for the public parser surface: SEC
+compatibility fixes, correctness fixes, packaging fixes, and dependency
+compatibility updates. New hosted-product capabilities are not backported into
+this package.
+
+That split keeps the local parser useful and auditable while the hosted
+EdgarParser API carries the agent-facing product surface.
+
 ## See also
 
-- **[edgar-mcp](https://github.com/henrysouchien/edgar-mcp)** — MCP server that exposes EDGAR financial data as AI agent tools. If you're building with Claude Code or another MCP-compatible agent, use this instead.
+- **[EdgarParser docs](https://docs.edgarparser.com)** — hosted API, tool reference, MCP setup, and changelog.
+- **[edgar-mcp](https://github.com/henrysouchien/edgar-mcp)** — MCP server that exposes the hosted API as AI-agent tools.
