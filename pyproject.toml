@@ -23,6 +23,11 @@ dependencies = [
 
 [project.urls]
 Homepage = "https://github.com/henrysouchien/edgar-parser"
+Documentation = "https://docs.edgarparser.com"
+"Hosted API" = "https://www.edgarparser.com"
+"MCP Server" = "https://github.com/henrysouchien/edgar-mcp"
+"Tool Reference" = "https://docs.edgarparser.com/tools"
+Changelog = "https://docs.edgarparser.com/changelog"
 Source = "https://github.com/henrysouchien/edgar-parser"
 Issues = "https://github.com/henrysouchien/edgar-parser/issues"
 
